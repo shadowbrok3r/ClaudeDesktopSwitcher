@@ -69,8 +69,24 @@ fn dir_is_empty(p: &Path) -> bool {
     fs::read_dir(p).map(|mut i| i.next().is_none()).unwrap_or(true)
 }
 
+fn profile_has_session(path: &Path) -> bool {
+    let config = path.join("config.json");
+    fs::read_to_string(&config)
+        .ok()
+        .is_some_and(|s| s.contains("oauth:tokenCache"))
+}
+
 fn persist_live_at(app_dir: &Path, profile_path: &Path) -> Result<(), String> {
     if profile_path.exists() {
+        if profile_has_session(profile_path) && !profile_has_session(app_dir) {
+            return Err(format!(
+                "refusing to overwrite authenticated profile '{}' with an unauthenticated session",
+                profile_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("profile")
+            ));
+        }
         let stale = profile_path.with_extension("stale");
         fs::remove_dir_all(&stale).ok();
         fs::rename(profile_path, &stale)
