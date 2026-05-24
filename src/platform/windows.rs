@@ -9,7 +9,7 @@ pub fn home() -> PathBuf {
         .expect("USERPROFILE not set")
 }
 
-fn msix_claude_dir() -> Option<PathBuf> {
+fn msix_package_dir() -> Option<PathBuf> {
     let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from)?;
     let packages = local.join("Packages");
     let entry = fs::read_dir(packages).ok()?.flatten().find(|e| {
@@ -17,9 +17,12 @@ fn msix_claude_dir() -> Option<PathBuf> {
             .to_string_lossy()
             .starts_with("Claude_")
     })?;
+    Some(entry.path())
+}
+
+fn msix_claude_dir() -> Option<PathBuf> {
     Some(
-        entry
-            .path()
+        msix_package_dir()?
             .join("LocalCache")
             .join("Roaming")
             .join("Claude"),
@@ -27,16 +30,8 @@ fn msix_claude_dir() -> Option<PathBuf> {
 }
 
 pub fn claude_app_dir() -> PathBuf {
-    if let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) {
-        let claude = appdata.join("Claude");
-        if claude.exists() {
-            return claude;
-        }
-    }
     if let Some(msix) = msix_claude_dir() {
-        if msix.exists() {
-            return msix;
-        }
+        return msix;
     }
     std::env::var_os("APPDATA")
         .map(|a| PathBuf::from(a).join("Claude"))
@@ -60,7 +55,7 @@ pub fn remove_link(path: &Path) -> Result<(), String> {
 }
 
 pub fn create_link(target: &Path, link: &Path) -> Result<(), String> {
-    junction::create(link, target).map_err(|e| format!("junction: {e}"))
+    junction::create(target, link).map_err(|e| format!("junction: {e}"))
 }
 
 pub fn read_link_target(link: &Path) -> Option<PathBuf> {
@@ -89,16 +84,24 @@ pub fn kill_claude() {
     let _ = Command::new("taskkill")
         .args(["/IM", "claude.exe", "/F"])
         .status();
-    std::thread::sleep(Duration::from_millis(800));
+    for _ in 0..30 {
+        if !is_claude_running() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 pub fn relaunch_claude() {
-  let ps = r#"
+    let ps = r#"
 $app = Get-StartApps | Where-Object { $_.Name -eq 'Claude' } | Select-Object -First 1
-if ($app) { Start-Process $app.AppID; exit 0 }
+if ($app) {
+    Start-Process explorer.exe "shell:AppsFolder\$($app.AppID)"
+    exit 0
+}
 $exe = Join-Path $env:LOCALAPPDATA 'Programs\Claude\Claude.exe'
 if (Test-Path $exe) { Start-Process $exe; exit 0 }
-Start-Process 'claude:'
+Start-Process explorer.exe 'shell:AppsFolder\Claude_pzs8sxrjxfjjc!Claude'
 "#;
     let _ = Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", ps])

@@ -37,18 +37,61 @@ pub fn list_profiles() -> Vec<String> {
     out
 }
 
+const ACTIVE_MARKER: &str = ".active";
+
+fn read_active_marker() -> Option<String> {
+    fs::read_to_string(profiles_dir().join(ACTIVE_MARKER))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn write_active_marker(name: &str) -> Result<(), String> {
+    fs::write(profiles_dir().join(ACTIVE_MARKER), name)
+        .map_err(|e| format!("write active marker: {e}"))
+}
+
 pub fn current_profile() -> Option<String> {
     let link = claude_app_dir();
-    let target = platform::read_link_target(&link)?;
-    let pdir = fs::canonicalize(profiles_dir()).ok()?;
-    let rel = target.strip_prefix(&pdir).ok()?;
-    rel.components()
-        .next()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+    if let Some(from_link) = platform::read_link_target(&link).and_then(|target| {
+        let pdir = fs::canonicalize(profiles_dir()).ok()?;
+        let rel = target.strip_prefix(&pdir).ok()?;
+        rel.components()
+            .next()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+    }) {
+        return Some(from_link);
+    }
+    read_active_marker()
 }
 
 fn dir_is_empty(p: &Path) -> bool {
     fs::read_dir(p).map(|mut i| i.next().is_none()).unwrap_or(true)
+}
+
+fn persist_live_at(app_dir: &Path, profile_path: &Path) -> Result<(), String> {
+    if profile_path.exists() {
+        let stale = profile_path.with_extension("stale");
+        fs::remove_dir_all(&stale).ok();
+        fs::rename(profile_path, &stale)
+            .map_err(|e| format!("rotate profile dir: {e}"))?;
+        std::thread::spawn(move || {
+            let _ = fs::remove_dir_all(stale);
+        });
+    }
+    fs::rename(app_dir, profile_path).map_err(|e| format!("save live profile: {e}"))
+}
+
+fn sibling_profile(target: &str) -> Option<String> {
+    let others: Vec<String> = list_profiles()
+        .into_iter()
+        .filter(|p| p != target)
+        .collect();
+    if others.len() == 1 {
+        Some(others[0].clone())
+    } else {
+        None
+    }
 }
 
 pub fn switch_profile(name: &str) -> Result<(), String> {
@@ -59,42 +102,39 @@ pub fn switch_profile(name: &str) -> Result<(), String> {
     platform::kill_claude();
 
     let app_dir = claude_app_dir();
-    match fs::symlink_metadata(&app_dir) {
-        Ok(m) if m.file_type().is_symlink() => {
-            platform::remove_link(&app_dir)?;
-            fs::create_dir_all(&target).map_err(|e| format!("mkdir target: {e}"))?;
-        }
-        Ok(m) if m.is_dir() && !platform::is_link(&app_dir) => {
-            let target_missing = !target.exists();
-            let target_empty = target.exists() && dir_is_empty(&target);
-            if target_missing {
-                fs::rename(&app_dir, &target)
-                    .map_err(|e| format!("migrate config -> profile: {e}"))?;
-            } else if target_empty {
+    let leaving = current_profile();
+
+    if platform::is_link(&app_dir) {
+        platform::remove_link(&app_dir)?;
+    } else if app_dir.is_dir() {
+        if let Some(ref src) = leaving {
+            if src != name {
+                persist_live_at(&app_dir, &profiles.join(src))?;
+            } else if app_dir != target {
+                persist_live_at(&app_dir, &target)?;
+            }
+        } else if !target.exists() || dir_is_empty(&target) {
+            if target.exists() && dir_is_empty(&target) {
                 fs::remove_dir(&target).ok();
-                fs::rename(&app_dir, &target)
-                    .map_err(|e| format!("migrate config -> profile: {e}"))?;
-            } else {
-                backup_dir(&app_dir, "preswitch")?;
             }
+            fs::rename(&app_dir, &target)
+                .map_err(|e| format!("migrate config -> profile: {e}"))?;
+        } else if let Some(sibling) = sibling_profile(name) {
+            persist_live_at(&app_dir, &profiles.join(&sibling))?;
+        } else {
+            backup_dir(&app_dir, "preswitch")?;
         }
-        Ok(_) => {
-            if app_dir.exists() {
-                if platform::is_link(&app_dir) {
-                    platform::remove_link(&app_dir)?;
-                } else {
-                    fs::remove_file(&app_dir).ok();
-                }
-            }
-            fs::create_dir_all(&target).map_err(|e| format!("mkdir target: {e}"))?;
-        }
-        Err(_) => {
-            fs::create_dir_all(&target).map_err(|e| format!("mkdir target: {e}"))?;
+    } else if app_dir.exists() {
+        if platform::is_link(&app_dir) {
+            platform::remove_link(&app_dir)?;
+        } else {
+            fs::remove_file(&app_dir).ok();
         }
     }
 
+    fs::create_dir_all(&target).map_err(|e| format!("mkdir target: {e}"))?;
     platform::create_link(&target, &app_dir)?;
-    Ok(())
+    write_active_marker(name)
 }
 
 fn timestamp() -> String {
@@ -255,6 +295,7 @@ pub fn rename_profile(
         }
         fs::rename(&old_path, &new_path).map_err(|e| format!("rename: {e}"))?;
         platform::create_link(&new_path, &app_dir)?;
+        write_active_marker(new)?;
         if was_running && relaunch_after_switch {
             platform::relaunch_claude();
         }

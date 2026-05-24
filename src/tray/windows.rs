@@ -1,8 +1,8 @@
 use crate::profiles;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
-use tray_icon::{Icon, TrayIconBuilder};
+use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use winit::event::Event;
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::platform::windows::EventLoopBuilderExtWindows;
@@ -286,10 +286,21 @@ fn tray_icon() -> Icon {
     Icon::from_rgba(rgba, w, h).expect("icon rgba")
 }
 
+fn refresh_menu(state: &State, tray: &TrayIcon) {
+    let _ = tray.set_menu(Some(Box::new(build_menu(state))));
+}
+
+fn refresh_tooltip(tray: &TrayIcon) {
+    let _ = tray.set_tooltip(Some(&format!(
+        "Claude Switcher — {}",
+        profiles::active_tooltip()
+    )));
+}
+
 pub fn run() {
-    let state = Mutex::new(State {
+    let state = Arc::new(Mutex::new(State {
         relaunch_after_switch: true,
-    });
+    }));
 
     let mut builder = EventLoop::<UserEvent>::with_user_event();
     builder.with_any_thread(true);
@@ -303,7 +314,7 @@ pub fn run() {
         .with_icon(tray_icon())
         .build()
         .expect("tray icon");
-    let tray = Mutex::new(tray);
+    let tray = Arc::new(Mutex::new(tray));
 
     MenuEvent::set_event_handler(Some({
         let proxy = proxy.clone();
@@ -327,18 +338,14 @@ pub fn run() {
                 Event::UserEvent(UserEvent::Menu(ev)) => {
                     if let Ok(mut s) = state.lock() {
                         handle_menu_event(&ev.id, &mut s);
+                        if let Ok(tray) = tray.lock() {
+                            refresh_menu(&s, &tray);
+                        }
                     }
                 }
                 Event::UserEvent(UserEvent::Refresh) => {
-                    if let Ok(s) = state.lock() {
-                        let new_menu = build_menu(&s);
-                        if let Ok(tray) = tray.lock() {
-                            let _ = tray.set_menu(Some(Box::new(new_menu)));
-                            let _ = tray.set_tooltip(Some(&format!(
-                                "Claude Switcher — {}",
-                                profiles::active_tooltip()
-                            )));
-                        }
+                    if let Ok(tray) = tray.lock() {
+                        refresh_tooltip(&tray);
                     }
                 }
                 _ => {}
