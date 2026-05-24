@@ -4,8 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ksni = { version = "0.3.4", default-features = false, features = ["blocking", "async-io"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3.4", default-features = false, features = ["blocking", "async-io"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+tray-icon = "0.24"
+junction = "2.0.0"
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 
 [profile.release]
 strip = true
