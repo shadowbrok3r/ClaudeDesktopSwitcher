@@ -2,7 +2,16 @@
 
 A system tray app for switching between multiple Claude Desktop profiles on **Linux** and **Windows**.
 
-Each profile is a separate Claude config directory swapped in via symlink (Linux) or directory junction (Windows) — sessions, MCP configs, settings, and history stay isolated per profile.
+On Linux, each profile swaps **both** Claude products in lockstep via symlink, so work and personal stay fully isolated — neither account can read the other's sessions, settings, history, MCP servers, memories, or skills:
+
+| Product | Live path | Swapped to |
+|---|---|---|
+| Claude Desktop (Electron) | `~/.config/Claude` | `~/.config/claude-profiles/<name>/` |
+| Claude Code (CLI / Desktop's embedded agent) | `~/.claude` + `~/.claude.json` | `~/.config/claude-code-profiles/<name>/` + `<name>.json` |
+
+> Claude Desktop and Claude Code keep entirely separate config trees. Switching only the Desktop dir would leave both accounts sharing the same logged-in Claude Code session, memories, skills, and MCP servers — so the switcher manages both.
+
+On **Windows**, each profile is a separate Claude config directory swapped in via directory junction — sessions, MCP configs, settings, and history stay isolated per profile.
 
 ## Requirements
 
@@ -63,9 +72,11 @@ A tray icon appears in the system tray / notification area.
 
 Click the tray icon:
 
-- **Active: \<name\>** — current profile (read-only header).
-- **\<profile names\>** — click to switch. The active one is marked `●` and disabled.
-- **MCP servers ▸**
+- **Active: \<name\>** — current Desktop profile (read-only header).
+- **Claude Code: \<name\>** — read-only status. `✓` means `~/.claude` is linked to the same profile; `unmanaged` / `out of sync` means it isn't yet.
+- **Link Claude Code → \<active\>** — only shown when Claude Code isn't linked to the active profile. Captures the live `~/.claude` into the active profile and links it, without switching Desktop. Use this once to adopt your current Claude Code config.
+- **\<profile names\>** — click to switch (swaps Desktop **and** Claude Code). The active one is marked `●` and disabled.
+- **MCP servers ▸** — Claude *Desktop* MCP config (`claude_desktop_config.json`). Claude Code's MCP servers live in `~/.claude.json` and are isolated automatically by the profile swap.
   - Lists the current profile's MCP servers.
   - **Import from ▸ \<profile\>** — on Linux, a checklist dialog; on Windows, import all or pick individual servers from a submenu. Selected entries merge into the current config (same-named entries overwrite, but the old config is backed up first).
   - **Edit config…** — opens `claude_desktop_config.json` in your default editor.
@@ -84,12 +95,25 @@ If Claude is running, you get a confirmation before it's killed.
 **Linux:**
 
 ```
-~/.config/Claude               → symlink to active profile
-~/.config/claude-profiles/
-    personal/                  → real Claude config dir
+~/.config/Claude               → symlink to active Desktop profile
+~/.claude                      → symlink to active Claude Code profile
+~/.claude.json                 → symlink to active Claude Code state file
+
+~/.config/claude-profiles/         (Claude Desktop — Electron userData)
+    personal/
     work/
-    .backups/                  → timestamped pre-write copies
+    .backups/                      → timestamped pre-write copies
+
+~/.config/claude-code-profiles/    (Claude Code — CLI / embedded agent)
+    personal/      personal.json
+    work/          work.json
 ```
+
+Switching closes Claude, repoints all three symlinks to the chosen profile, and (optionally) relaunches. A brand-new profile starts with an empty Claude Code dir, so that account logs in fresh.
+
+### Adopting your existing Claude Code config
+
+The first time you switch (or via **Link Claude Code → \<active\>**), your live `~/.claude` and `~/.claude.json` are **moved** into the *currently active* profile — so whatever account you're logged into now is preserved under that name. From then on they're symlinks the switcher manages. The originals are captured by `fs::rename` (a move, same filesystem); on any conflict the live copy is backed up first (see below).
 
 **Windows:**
 
@@ -113,14 +137,18 @@ Every operation that could lose data writes a backup to `.backups/` first:
 |---|---|
 | Import MCP servers | previous `claude_desktop_config.json` |
 | Clear MCP servers | previous `claude_desktop_config.json` |
-| Edit config… | atomic write (`.tmp` + rename) — no partial writes |
-| Switch profile (live dir conflicts with target) | live dir moved to `.backups/<ts>_preswitch_Claude/` |
+| `Edit config…` | atomic write (`.tmp` + rename) — no partial writes |
+| Switch profile (live Desktop dir conflicts with target) | live dir moved to `.backups/<ts>_preswitch_Claude/` |
+| Switch / link Claude Code (live `~/.claude` conflicts with target) | live dir moved to `.backups/<ts>_preswitch-code_.claude/` |
+| Switch / link Claude Code (live `~/.claude.json` conflicts) | previous file copied to `.backups/<ts>_preswitch-code_.claude.json` |
 
 Backups are timestamped (`<unix-ts>_<profile>_<filename>`) and never auto-pruned. To restore, copy a backup back into the profile dir.
 
 ## Notes
 
-- Closing Claude before switching is required — Electron locks its config dir. The switcher kills it automatically (after confirmation if it was running).
-- Profile dirs are real directories on disk; the active one is reached via the symlink/junction. Manual edits to either are safe.
-- If a Claude auto-update ever replaces the link with a real directory, the next switch will treat it as unmanaged state and back it up before re-linking.
+- Closing Claude before switching is required — Electron locks its config dir, and Claude Code holds `~/.claude` open. The switcher kills both automatically (after confirmation if anything was running). **This includes Claude Desktop's embedded agent**, which is a `claude` process using `~/.claude`, so an in-progress agent session ends on switch.
+- Process matching is deliberately narrow so a switch doesn't kill unrelated things: Claude Desktop is matched by the Electron flag `--class=Claude` (plus its `--user-data-dir` helpers and the `claude-desktop` launcher); Claude Code is matched by the **exact** process name `claude`. A shell or editor whose path merely contains "Claude" is left alone.
+- Profile dirs are real directories on disk; the active one is reached via the symlinks at `~/.config/Claude`, `~/.claude`, and `~/.claude.json` on Linux, or via junction at `%APPDATA%\Claude` on Windows. Manual edits to either are safe.
+- Isolation is logical, not OS-enforced: all profiles belong to your Unix user, so the guarantee is "the inactive account's data isn't on any path Claude reads," not a permission boundary.
+- If a Claude auto-update ever replaces a symlink with a real directory, the next switch treats it as unmanaged state and backs it up before re-linking.
 - On Windows, MCP import uses confirm dialogs and per-server submenu items instead of KDE's checklist dialog.

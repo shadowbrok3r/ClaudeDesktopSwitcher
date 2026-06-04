@@ -292,6 +292,10 @@ pub fn rename_profile(
     if new_path.exists() {
         return Err(format!("'{new}' already exists"));
     }
+    #[cfg(target_os = "linux")]
+    if code_profile_dir(new).exists() || code_profile_json(new).exists() {
+        return Err(format!("'{new}' already exists (Claude Code)"));
+    }
 
     let is_active = current_profile().as_deref() == Some(old);
     let was_running = platform::is_claude_running();
@@ -312,11 +316,15 @@ pub fn rename_profile(
         fs::rename(&old_path, &new_path).map_err(|e| format!("rename: {e}"))?;
         platform::create_link(&new_path, &app_dir)?;
         write_active_marker(new)?;
+        #[cfg(target_os = "linux")]
+        rename_code_profile(old, new, true)?;
         if was_running && relaunch_after_switch {
             platform::relaunch_claude();
         }
     } else {
         fs::rename(&old_path, &new_path).map_err(|e| format!("rename: {e}"))?;
+        #[cfg(target_os = "linux")]
+        rename_code_profile(old, new, false)?;
     }
     Ok(())
 }
@@ -334,12 +342,31 @@ pub fn after_config_change() {
 
 pub fn do_switch(name: &str, relaunch_after_switch: bool) {
     if platform::is_claude_running()
-        && !platform::confirm("Claude is running and will be closed to switch profile. Continue?")
+        && !platform::confirm(
+            "Claude Desktop and Claude Code will be closed to switch profile. Continue?",
+        )
     {
         return;
     }
+    #[cfg(target_os = "linux")]
+    {
+        let outgoing = current_profile().unwrap_or_else(|| name.to_string());
+        platform::kill_claude();
+        if let Err(e) = capture_unmanaged_code(&outgoing) {
+            platform::notify(&format!("Claude Code capture failed: {e}"));
+            return;
+        }
+    }
     match switch_profile(name) {
         Ok(()) => {
+            #[cfg(target_os = "linux")]
+            if let Err(e) = link_code(name) {
+                platform::notify(&format!("Switched Desktop, but Claude Code link failed: {e}"));
+                if relaunch_after_switch {
+                    platform::relaunch_claude();
+                }
+                return;
+            }
             platform::notify(&format!("Switched to '{name}'"));
             if relaunch_after_switch {
                 platform::relaunch_claude();
@@ -429,7 +456,155 @@ pub fn clear_all_mcp() {
     }
 }
 
-pub fn active_tooltip() -> String {
-    let cur = current_profile().unwrap_or_else(|| "(unmanaged)".into());
-    format!("Active profile: {cur}")
+// ── Claude Code profile management (Linux only) ──────────────────────────────
+
+#[cfg(target_os = "linux")]
+fn code_profile_dir(name: &str) -> std::path::PathBuf {
+    platform::code_profiles_dir().join(name)
+}
+
+#[cfg(target_os = "linux")]
+fn code_profile_json(name: &str) -> std::path::PathBuf {
+    platform::code_profiles_dir().join(format!("{name}.json"))
+}
+
+#[cfg(target_os = "linux")]
+pub fn current_code_profile() -> Option<String> {
+    platform::read_link_target(&platform::code_app_dir()).and_then(|target| {
+        let base = fs::canonicalize(platform::code_profiles_dir()).ok()?;
+        let rel = target.strip_prefix(&base).ok()?;
+        rel.components()
+            .next()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+    })
+}
+
+// Move a live, not-yet-managed ~/.claude (+ ~/.claude.json) into `owner`'s
+// code profile. No-op if already a symlink. Caller must close Claude first.
+#[cfg(target_os = "linux")]
+pub fn capture_unmanaged_code(owner: &str) -> Result<(), String> {
+    let app = platform::code_app_dir();
+    match fs::symlink_metadata(&app) {
+        Ok(m) if m.file_type().is_symlink() => {}
+        Ok(m) if m.is_dir() => {
+            fs::create_dir_all(platform::code_profiles_dir())
+                .map_err(|e| format!("mkdir code profiles: {e}"))?;
+            let target = code_profile_dir(owner);
+            if !target.exists() {
+                fs::rename(&app, &target).map_err(|e| format!("capture ~/.claude: {e}"))?;
+            } else if dir_is_empty(&target) {
+                fs::remove_dir(&target).ok();
+                fs::rename(&app, &target).map_err(|e| format!("capture ~/.claude: {e}"))?;
+            } else {
+                backup_dir(&app, "preswitch-code")?;
+            }
+        }
+        Ok(_) => { fs::remove_file(&app).ok(); }
+        Err(_) => {}
+    }
+
+    let appjson = platform::code_app_json();
+    match fs::symlink_metadata(&appjson) {
+        Ok(m) if m.file_type().is_symlink() => {}
+        Ok(_) => {
+            fs::create_dir_all(platform::code_profiles_dir())
+                .map_err(|e| format!("mkdir code profiles: {e}"))?;
+            let target = code_profile_json(owner);
+            if !target.exists() {
+                fs::rename(&appjson, &target)
+                    .map_err(|e| format!("capture ~/.claude.json: {e}"))?;
+            } else {
+                backup_file(&appjson, "preswitch-code")?;
+                fs::remove_file(&appjson).ok();
+            }
+        }
+        Err(_) => {}
+    }
+    Ok(())
+}
+
+// Point ~/.claude and ~/.claude.json at `name`'s code profile, creating it if
+// needed. Caller must close Claude first.
+#[cfg(target_os = "linux")]
+pub fn link_code(name: &str) -> Result<(), String> {
+    use std::os::unix::fs as unix_fs;
+
+    let target = code_profile_dir(name);
+    fs::create_dir_all(&target).map_err(|e| format!("mkdir code profile: {e}"))?;
+
+    let app = platform::code_app_dir();
+    match fs::symlink_metadata(&app) {
+        Ok(m) if m.file_type().is_symlink() => {
+            fs::remove_file(&app).map_err(|e| format!("unlink ~/.claude: {e}"))?;
+        }
+        Ok(m) if m.is_dir() => { backup_dir(&app, "preswitch-code")?; }
+        Ok(_) => { fs::remove_file(&app).ok(); }
+        Err(_) => {}
+    }
+    unix_fs::symlink(&target, &app).map_err(|e| format!("symlink ~/.claude: {e}"))?;
+
+    let target_json = code_profile_json(name);
+    if !target_json.exists() {
+        fs::write(&target_json, "{}\n").map_err(|e| format!("init code json: {e}"))?;
+    }
+    let appjson = platform::code_app_json();
+    match fs::symlink_metadata(&appjson) {
+        Ok(m) if m.file_type().is_symlink() => {
+            fs::remove_file(&appjson).map_err(|e| format!("unlink ~/.claude.json: {e}"))?;
+        }
+        Ok(_) => {
+            backup_file(&appjson, "preswitch-code")?;
+            fs::remove_file(&appjson).ok();
+        }
+        Err(_) => {}
+    }
+    unix_fs::symlink(&target_json, &appjson)
+        .map_err(|e| format!("symlink ~/.claude.json: {e}"))?;
+    Ok(())
+}
+
+// Rename a profile's Claude Code dir + json to match a Desktop-profile rename,
+// repointing the live symlinks when the renamed profile is active.
+#[cfg(target_os = "linux")]
+pub fn rename_code_profile(old: &str, new: &str, active: bool) -> Result<(), String> {
+    use std::os::unix::fs as unix_fs;
+
+    let code_old = code_profile_dir(old);
+    let code_new = code_profile_dir(new);
+    let json_old = code_profile_json(old);
+    let json_new = code_profile_json(new);
+
+    if active {
+        let app = platform::code_app_dir();
+        if app.is_symlink() {
+            fs::remove_file(&app).map_err(|e| format!("unlink ~/.claude: {e}"))?;
+        }
+        if code_old.exists() {
+            fs::rename(&code_old, &code_new).map_err(|e| format!("rename code dir: {e}"))?;
+        } else {
+            fs::create_dir_all(&code_new).map_err(|e| format!("mkdir code dir: {e}"))?;
+        }
+        unix_fs::symlink(&code_new, &app).map_err(|e| format!("relink ~/.claude: {e}"))?;
+
+        let appjson = platform::code_app_json();
+        if appjson.is_symlink() {
+            fs::remove_file(&appjson).map_err(|e| format!("unlink ~/.claude.json: {e}"))?;
+        }
+        if json_old.exists() {
+            fs::rename(&json_old, &json_new).map_err(|e| format!("rename code json: {e}"))?;
+        }
+        if !json_new.exists() {
+            fs::write(&json_new, "{}\n").map_err(|e| format!("init code json: {e}"))?;
+        }
+        unix_fs::symlink(&json_new, &appjson)
+            .map_err(|e| format!("relink ~/.claude.json: {e}"))?;
+    } else {
+        if code_old.exists() {
+            fs::rename(&code_old, &code_new).map_err(|e| format!("rename code dir: {e}"))?;
+        }
+        if json_old.exists() {
+            fs::rename(&json_old, &json_new).map_err(|e| format!("rename code json: {e}"))?;
+        }
+    }
+    Ok(())
 }

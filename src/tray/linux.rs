@@ -137,9 +137,11 @@ impl Tray for App {
         "system-switch-user".into()
     }
     fn tool_tip(&self) -> ksni::ToolTip {
+        let cur = profiles::current_profile().unwrap_or_else(|| "(unmanaged)".into());
+        let code = profiles::current_code_profile().unwrap_or_else(|| "unmanaged".into());
         ksni::ToolTip {
             title: "Claude Switcher".into(),
-            description: profiles::active_tooltip(),
+            description: format!("Desktop: {cur}  •  Code: {code}"),
             icon_name: "system-switch-user".into(),
             icon_pixmap: vec![],
         }
@@ -162,6 +164,36 @@ impl Tray for App {
             }
             .into(),
         );
+
+        let code_current = profiles::current_code_profile();
+        let code_in_sync = current.is_some() && code_current == current;
+        let code_label = match &code_current {
+            Some(c) if code_in_sync => format!("Claude Code: {c} ✓"),
+            Some(c) => format!("Claude Code: {c} (out of sync)"),
+            None => "Claude Code: unmanaged".into(),
+        };
+        items.push(
+            StandardItem {
+                label: code_label,
+                enabled: false,
+                ..Default::default()
+            }
+            .into(),
+        );
+        if current.is_some() && !code_in_sync {
+            let relaunch = self.relaunch_after_switch;
+            items.push(
+                StandardItem {
+                    label: format!(
+                        "Link Claude Code → {}",
+                        current.as_deref().unwrap_or("")
+                    ),
+                    activate: Box::new(move |_: &mut Self| do_link_code(relaunch)),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
         items.push(MenuItem::Separator);
 
         if profile_list.is_empty() {
@@ -228,7 +260,6 @@ impl Tray for App {
                 .iter()
                 .map(|p| {
                     let old = p.clone();
-                    let relaunch = self.relaunch_after_switch;
                     StandardItem {
                         label: p.clone(),
                         activate: Box::new(move |this: &mut Self| {
@@ -294,6 +325,37 @@ impl Tray for App {
         );
 
         items
+    }
+}
+
+fn do_link_code(relaunch_after_switch: bool) {
+    let Some(active) = profiles::current_profile() else {
+        crate::platform::notify("No active profile — switch to one first");
+        return;
+    };
+    if profiles::current_code_profile().as_deref() == Some(active.as_str()) {
+        crate::platform::notify(&format!("Claude Code already linked to '{active}'"));
+        return;
+    }
+    if crate::platform::is_claude_running()
+        && !crate::platform::confirm(
+            "Claude must close to capture its Claude Code data. Continue?",
+        )
+    {
+        return;
+    }
+    crate::platform::kill_claude();
+    if let Err(e) = profiles::capture_unmanaged_code(&active) {
+        crate::platform::notify(&format!("Capture failed: {e}"));
+        return;
+    }
+    if let Err(e) = profiles::link_code(&active) {
+        crate::platform::notify(&format!("Link failed: {e}"));
+        return;
+    }
+    crate::platform::notify(&format!("Claude Code linked to '{active}'"));
+    if relaunch_after_switch {
+        crate::platform::relaunch_claude();
     }
 }
 

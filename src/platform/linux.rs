@@ -18,6 +18,18 @@ pub fn profiles_dir() -> PathBuf {
     home().join(".config").join("claude-profiles")
 }
 
+pub fn code_app_dir() -> PathBuf {
+    home().join(".claude")
+}
+
+pub fn code_app_json() -> PathBuf {
+    home().join(".claude.json")
+}
+
+pub fn code_profiles_dir() -> PathBuf {
+    home().join(".config").join("claude-code-profiles")
+}
+
 pub fn is_link(path: &Path) -> bool {
     fs::symlink_metadata(path)
         .map(|m| m.file_type().is_symlink())
@@ -42,26 +54,43 @@ pub fn read_link_target(link: &Path) -> Option<PathBuf> {
     fs::canonicalize(&abs).ok()
 }
 
-pub fn is_claude_running() -> bool {
+fn pgrep_hit(args: &[&str]) -> bool {
     Command::new("pgrep")
-        .args(["-f", "[Cc]laude"])
+        .args(args)
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
+// Match the Electron WM class flag, not the substring "Claude" (which would
+// also catch this switcher, editors, or shell sessions in a Claude-named path).
+pub fn is_desktop_running() -> bool {
+    pgrep_hit(&["-f", "--", "--class=Claude"])
+}
+
+// Claude Code CLI / Desktop's embedded agent — matched by exact process name.
+pub fn is_code_running() -> bool {
+    pgrep_hit(&["-x", "claude"])
+}
+
+pub fn is_claude_running() -> bool {
+    is_desktop_running() || is_code_running()
+}
+
 pub fn kill_claude() {
+    let _ = Command::new("pkill").args(["-f", "--", "--class=Claude"]).status();
+    let udd = format!("--user-data-dir={}", claude_app_dir().display());
+    let _ = Command::new("pkill").args(["-f", "--", &udd]).status();
+    let _ = Command::new("pkill").args(["-f", "claude-desktop"]).status();
     let _ = Command::new("pkill").args(["-x", "claude"]).status();
-    let _ = Command::new("pkill").args(["-f", "Claude"]).status();
-    std::thread::sleep(Duration::from_millis(600));
+    std::thread::sleep(Duration::from_millis(800));
 }
 
 pub fn relaunch_claude() {
     let _ = Command::new("sh")
         .arg("-c")
         .arg("(setsid claude-desktop >/dev/null 2>&1 < /dev/null &) \
-              || (setsid Claude       >/dev/null 2>&1 < /dev/null &) \
-              || (setsid claude       >/dev/null 2>&1 < /dev/null &)")
+              || (setsid Claude       >/dev/null 2>&1 < /dev/null &)")
         .status();
 }
 
