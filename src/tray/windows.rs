@@ -1,4 +1,4 @@
-use crate::profiles;
+use crate::profiles::{self, RunMode};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
@@ -22,14 +22,42 @@ fn menu_id(label: &str) -> MenuId {
 
 fn build_menu(state: &State) -> Menu {
     let menu = Menu::new();
+    let mode = profiles::run_mode();
     let current = profiles::current_profile();
     let profile_list = profiles::list_profiles();
 
-    let header = match &current {
-        Some(p) => format!("Active: {p}"),
-        None => "Active: (unmanaged)".into(),
-    };
-    let _ = menu.append(&MenuItem::with_id(menu_id("header"), header, false, None));
+    match mode {
+        RunMode::Switch => {
+            let header = match &current {
+                Some(p) => format!("Active: {p}"),
+                None => "Active: (unmanaged)".into(),
+            };
+            let _ = menu.append(&MenuItem::with_id(menu_id("header"), header, false, None));
+        }
+        RunMode::MultiInstance => {
+            let mcp = current
+                .clone()
+                .unwrap_or_else(|| "(none)".into());
+            let _ = menu.append(&MenuItem::with_id(
+                menu_id("header"),
+                format!("MCP profile: {mcp}"),
+                false,
+                None,
+            ));
+            let running = profiles::running_profiles();
+            let running_label = if running.is_empty() {
+                "Running: none".into()
+            } else {
+                format!("Running: {}", running.join(", "))
+            };
+            let _ = menu.append(&MenuItem::with_id(
+                menu_id("running"),
+                running_label,
+                false,
+                None,
+            ));
+        }
+    }
     let _ = menu.append(&PredefinedMenuItem::separator());
 
     if profile_list.is_empty() {
@@ -40,19 +68,72 @@ fn build_menu(state: &State) -> Menu {
             None,
         ));
     } else {
-        for p in &profile_list {
-            let is_cur = Some(p) == current.as_ref();
-            let label = if is_cur {
-                format!("● {p}")
-            } else {
-                format!("    {p}")
-            };
-            let _ = menu.append(&MenuItem::with_id(
-                menu_id(&format!("switch:{p}")),
-                label,
-                !is_cur,
-                None,
-            ));
+        match mode {
+            RunMode::Switch => {
+                for p in &profile_list {
+                    let is_cur = Some(p) == current.as_ref();
+                    let label = if is_cur {
+                        format!("● {p}")
+                    } else {
+                        format!("    {p}")
+                    };
+                    let _ = menu.append(&MenuItem::with_id(
+                        menu_id(&format!("switch:{p}")),
+                        label,
+                        !is_cur,
+                        None,
+                    ));
+                }
+            }
+            RunMode::MultiInstance => {
+                for p in &profile_list {
+                    let running = profiles::is_profile_running(p);
+                    let is_mcp = Some(p) == current.as_ref();
+                    let suffix = match (running, is_mcp) {
+                        (true, true) => " ▶ running, MCP",
+                        (true, false) => " ▶ running",
+                        (false, true) => " (MCP)",
+                        (false, false) => "",
+                    };
+                    let _ = menu.append(&MenuItem::with_id(
+                        menu_id(&format!("toggle:{p}")),
+                        format!("{p}{suffix}"),
+                        true,
+                        None,
+                    ));
+                }
+                let _ = menu.append(&PredefinedMenuItem::separator());
+                let _ = menu.append(&MenuItem::with_id(
+                    menu_id("launch-all"),
+                    "Launch all",
+                    true,
+                    None,
+                ));
+                let _ = menu.append(&MenuItem::with_id(
+                    menu_id("close-all"),
+                    "Close all",
+                    !profiles::running_profiles().is_empty(),
+                    None,
+                ));
+                if profile_list.len() > 1 {
+                    let set_mcp = Submenu::with_id(menu_id("set-mcp"), "Set MCP profile", true);
+                    for p in &profile_list {
+                        let is_cur = Some(p) == current.as_ref();
+                        let label = if is_cur {
+                            format!("● {p}")
+                        } else {
+                            p.clone()
+                        };
+                        let _ = set_mcp.append(&MenuItem::with_id(
+                            menu_id(&format!("set-mcp:{p}")),
+                            label,
+                            !is_cur,
+                            None,
+                        ));
+                    }
+                    let _ = menu.append(&set_mcp);
+                }
+            }
         }
     }
 
@@ -67,12 +148,28 @@ fn build_menu(state: &State) -> Menu {
     ));
     let _ = menu.append(&build_rename_submenu(&profile_list));
     let _ = menu.append(&CheckMenuItem::with_id(
-        menu_id("relaunch"),
-        "Relaunch Claude after switch",
+        menu_id("mode-switch"),
+        "Switch profiles (one at a time)",
         true,
-        state.relaunch_after_switch,
+        mode == RunMode::Switch,
         None,
     ));
+    let _ = menu.append(&CheckMenuItem::with_id(
+        menu_id("mode-multi"),
+        "Multiple instances (side by side)",
+        true,
+        mode == RunMode::MultiInstance,
+        None,
+    ));
+    if mode == RunMode::Switch {
+        let _ = menu.append(&CheckMenuItem::with_id(
+            menu_id("relaunch"),
+            "Relaunch Claude after switch",
+            true,
+            state.relaunch_after_switch,
+            None,
+        ));
+    }
     let _ = menu.append(&MenuItem::with_id(
         menu_id("open-profiles"),
         "Open profiles folder",
@@ -218,9 +315,40 @@ fn handle_menu_event(id: &MenuId, state: &mut State) {
         profiles::do_switch(name, state.relaunch_after_switch);
         return;
     }
+    if let Some(name) = key.strip_prefix("toggle:") {
+        profiles::toggle_profile(name);
+        return;
+    }
+    if key == "launch-all" {
+        profiles::launch_all_profiles();
+        return;
+    }
+    if key == "close-all" {
+        profiles::close_all_profiles();
+        return;
+    }
+    if let Some(name) = key.strip_prefix("set-mcp:") {
+        match profiles::set_primary_profile(name) {
+            Ok(()) => crate::platform::notify(&format!("MCP profile set to '{name}'")),
+            Err(e) => crate::platform::notify(&format!("Set MCP profile failed: {e}")),
+        }
+        return;
+    }
+    if key == "mode-switch" {
+        if profiles::run_mode() != RunMode::Switch {
+            profiles::toggle_run_mode();
+        }
+        return;
+    }
+    if key == "mode-multi" {
+        if profiles::run_mode() != RunMode::MultiInstance {
+            profiles::toggle_run_mode();
+        }
+        return;
+    }
     if key == "new-profile" {
         if let Some(name) = profiles::prompt_new_profile() {
-            profiles::do_switch(&name, state.relaunch_after_switch);
+            profiles::do_new_profile(&name, state.relaunch_after_switch);
         }
         return;
     }
@@ -291,10 +419,18 @@ fn refresh_menu(state: &State, tray: &TrayIcon) {
 }
 
 fn refresh_tooltip(tray: &TrayIcon) {
-    let _ = tray.set_tooltip(Some(&format!(
-        "Claude Switcher — {}",
-        profiles::active_tooltip()
-    )));
+    let tip = match profiles::run_mode() {
+        RunMode::Switch => format!("Claude Switcher — {}", profiles::active_tooltip()),
+        RunMode::MultiInstance => {
+            let running = profiles::running_profiles();
+            if running.is_empty() {
+                "Claude Switcher — none running".into()
+            } else {
+                format!("Claude Switcher — {}", running.join(", "))
+            }
+        }
+    };
+    let _ = tray.set_tooltip(Some(&tip));
 }
 
 pub fn run() {

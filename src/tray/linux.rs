@@ -1,4 +1,4 @@
-use crate::profiles;
+use crate::profiles::{self, RunMode};
 use ksni::{
     MenuItem, Tray,
     blocking::TrayMethods,
@@ -137,62 +137,107 @@ impl Tray for App {
         "system-switch-user".into()
     }
     fn tool_tip(&self) -> ksni::ToolTip {
-        let cur = profiles::current_profile().unwrap_or_else(|| "(unmanaged)".into());
-        let code = profiles::current_code_profile().unwrap_or_else(|| "unmanaged".into());
+        let description = match profiles::run_mode() {
+            RunMode::Switch => {
+                let cur = profiles::active_tooltip();
+                let code = profiles::current_code_profile().unwrap_or_else(|| "unmanaged".into());
+                format!("Desktop: {cur}  •  Code: {code}")
+            }
+            RunMode::MultiInstance => {
+                let running = profiles::running_profiles();
+                if running.is_empty() {
+                    "Multiple instances — none running".into()
+                } else {
+                    format!("Running: {}", running.join(", "))
+                }
+            }
+        };
         ksni::ToolTip {
             title: "Claude Switcher".into(),
-            description: format!("Desktop: {cur}  •  Code: {code}"),
+            description,
             icon_name: "system-switch-user".into(),
             icon_pixmap: vec![],
         }
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
+        let mode = profiles::run_mode();
         let current = profiles::current_profile();
         let profile_list = profiles::list_profiles();
         let mut items: Vec<MenuItem<Self>> = Vec::new();
 
-        let header = match &current {
-            Some(p) => format!("Active: {p}"),
-            None => "Active: (unmanaged)".into(),
-        };
-        items.push(
-            StandardItem {
-                label: header,
-                enabled: false,
-                ..Default::default()
-            }
-            .into(),
-        );
+        match mode {
+            RunMode::Switch => {
+                let header = match &current {
+                    Some(p) => format!("Active: {p}"),
+                    None => "Active: (unmanaged)".into(),
+                };
+                items.push(
+                    StandardItem {
+                        label: header,
+                        enabled: false,
+                        ..Default::default()
+                    }
+                    .into(),
+                );
 
-        let code_current = profiles::current_code_profile();
-        let code_in_sync = current.is_some() && code_current == current;
-        let code_label = match &code_current {
-            Some(c) if code_in_sync => format!("Claude Code: {c} ✓"),
-            Some(c) => format!("Claude Code: {c} (out of sync)"),
-            None => "Claude Code: unmanaged".into(),
-        };
-        items.push(
-            StandardItem {
-                label: code_label,
-                enabled: false,
-                ..Default::default()
-            }
-            .into(),
-        );
-        if current.is_some() && !code_in_sync {
-            let relaunch = self.relaunch_after_switch;
-            items.push(
-                StandardItem {
-                    label: format!(
-                        "Link Claude Code → {}",
-                        current.as_deref().unwrap_or("")
-                    ),
-                    activate: Box::new(move |_: &mut Self| do_link_code(relaunch)),
-                    ..Default::default()
+                let code_current = profiles::current_code_profile();
+                let code_in_sync = current.is_some() && code_current == current;
+                let code_label = match &code_current {
+                    Some(c) if code_in_sync => format!("Claude Code: {c} ✓"),
+                    Some(c) => format!("Claude Code: {c} (out of sync)"),
+                    None => "Claude Code: unmanaged".into(),
+                };
+                items.push(
+                    StandardItem {
+                        label: code_label,
+                        enabled: false,
+                        ..Default::default()
+                    }
+                    .into(),
+                );
+                if current.is_some() && !code_in_sync {
+                    let relaunch = self.relaunch_after_switch;
+                    items.push(
+                        StandardItem {
+                            label: format!(
+                                "Link Claude Code → {}",
+                                current.as_deref().unwrap_or("")
+                            ),
+                            activate: Box::new(move |_: &mut Self| do_link_code(relaunch)),
+                            ..Default::default()
+                        }
+                        .into(),
+                    );
                 }
-                .into(),
-            );
+            }
+            RunMode::MultiInstance => {
+                let mcp = current
+                    .clone()
+                    .unwrap_or_else(|| "(none)".into());
+                items.push(
+                    StandardItem {
+                        label: format!("MCP profile: {mcp}"),
+                        enabled: false,
+                        ..Default::default()
+                    }
+                    .into(),
+                );
+                let running = profiles::running_profiles();
+                let running_label = if running.is_empty() {
+                    "Running: none".into()
+                } else {
+                    format!("Running: {}", running.join(", "))
+                };
+                items.push(
+                    StandardItem {
+                        label: running_label,
+                        enabled: false,
+                        ..Default::default()
+                    }
+                    .into(),
+                );
+            }
         }
         items.push(MenuItem::Separator);
 
@@ -206,26 +251,100 @@ impl Tray for App {
                 .into(),
             );
         } else {
-            for p in &profile_list {
-                let is_cur = Some(p) == current.as_ref();
-                let label = if is_cur {
-                    format!("● {p}")
-                } else {
-                    format!("    {p}")
-                };
-                let name = p.clone();
-                let relaunch = self.relaunch_after_switch;
-                items.push(
-                    StandardItem {
-                        label,
-                        enabled: !is_cur,
-                        activate: Box::new(move |_: &mut Self| {
-                            profiles::do_switch(&name, relaunch);
-                        }),
-                        ..Default::default()
+            match mode {
+                RunMode::Switch => {
+                    for p in &profile_list {
+                        let is_cur = Some(p) == current.as_ref();
+                        let label = if is_cur {
+                            format!("● {p}")
+                        } else {
+                            format!("    {p}")
+                        };
+                        let name = p.clone();
+                        let relaunch = self.relaunch_after_switch;
+                        items.push(
+                            StandardItem {
+                                label,
+                                enabled: !is_cur,
+                                activate: Box::new(move |_: &mut Self| {
+                                    profiles::do_switch(&name, relaunch);
+                                }),
+                                ..Default::default()
+                            }
+                            .into(),
+                        );
                     }
-                    .into(),
-                );
+                }
+                RunMode::MultiInstance => {
+                    for p in &profile_list {
+                        let running = profiles::is_profile_running(p);
+                        let is_mcp = Some(p) == current.as_ref();
+                        let suffix = match (running, is_mcp) {
+                            (true, true) => " ▶ running, MCP",
+                            (true, false) => " ▶ running",
+                            (false, true) => " (MCP)",
+                            (false, false) => "",
+                        };
+                        let label = format!("{p}{suffix}");
+                        let name = p.clone();
+                        items.push(
+                            StandardItem {
+                                label,
+                                activate: Box::new(move |_: &mut Self| {
+                                    profiles::toggle_profile(&name);
+                                }),
+                                ..Default::default()
+                            }
+                            .into(),
+                        );
+                    }
+                    items.push(MenuItem::Separator);
+                    items.push(
+                        StandardItem {
+                            label: "Launch all".into(),
+                            activate: Box::new(|_: &mut Self| profiles::launch_all_profiles()),
+                            ..Default::default()
+                        }
+                        .into(),
+                    );
+                    items.push(
+                        StandardItem {
+                            label: "Close all".into(),
+                            enabled: !profiles::running_profiles().is_empty(),
+                            activate: Box::new(|_: &mut Self| profiles::close_all_profiles()),
+                            ..Default::default()
+                        }
+                        .into(),
+                    );
+                    if profile_list.len() > 1 {
+                        let set_mcp_items: Vec<MenuItem<Self>> = profile_list
+                            .iter()
+                            .map(|p| {
+                                let name = p.clone();
+                                let is_cur = Some(p) == current.as_ref();
+                                StandardItem {
+                                    label: if is_cur {
+                                        format!("● {p}")
+                                    } else {
+                                        p.clone()
+                                    },
+                                    enabled: !is_cur,
+                                    activate: Box::new(move |_: &mut Self| set_mcp_profile(&name)),
+                                    ..Default::default()
+                                }
+                                .into()
+                            })
+                            .collect();
+                        items.push(
+                            SubMenu {
+                                label: "Set MCP profile".into(),
+                                submenu: set_mcp_items,
+                                ..Default::default()
+                            }
+                            .into(),
+                        );
+                    }
+                }
             }
         }
 
@@ -238,7 +357,7 @@ impl Tray for App {
                 label: "New profile…".into(),
                 activate: Box::new(|this: &mut Self| {
                     if let Some(name) = profiles::prompt_new_profile() {
-                        profiles::do_switch(&name, this.relaunch_after_switch);
+                        profiles::do_new_profile(&name, this.relaunch_after_switch);
                     }
                 }),
                 ..Default::default()
@@ -295,15 +414,44 @@ impl Tray for App {
 
         items.push(
             CheckmarkItem {
-                label: "Relaunch Claude after switch".into(),
-                checked: self.relaunch_after_switch,
-                activate: Box::new(|this: &mut Self| {
-                    this.relaunch_after_switch = !this.relaunch_after_switch;
+                label: "Switch profiles (one at a time)".into(),
+                checked: mode == RunMode::Switch,
+                activate: Box::new(|_: &mut Self| {
+                    if profiles::run_mode() != RunMode::Switch {
+                        profiles::toggle_run_mode();
+                    }
                 }),
                 ..Default::default()
             }
             .into(),
         );
+        items.push(
+            CheckmarkItem {
+                label: "Multiple instances (side by side)".into(),
+                checked: mode == RunMode::MultiInstance,
+                activate: Box::new(|_: &mut Self| {
+                    if profiles::run_mode() != RunMode::MultiInstance {
+                        profiles::toggle_run_mode();
+                    }
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
+
+        if mode == RunMode::Switch {
+            items.push(
+                CheckmarkItem {
+                    label: "Relaunch Claude after switch".into(),
+                    checked: self.relaunch_after_switch,
+                    activate: Box::new(|this: &mut Self| {
+                        this.relaunch_after_switch = !this.relaunch_after_switch;
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
 
         items.push(
             StandardItem {
@@ -325,6 +473,16 @@ impl Tray for App {
         );
 
         items
+    }
+}
+
+fn set_mcp_profile(name: &str) {
+    if profiles::current_profile().as_deref() == Some(name) {
+        return;
+    }
+    match profiles::set_primary_profile(name) {
+        Ok(()) => crate::platform::notify(&format!("MCP profile set to '{name}'")),
+        Err(e) => crate::platform::notify(&format!("Set MCP profile failed: {e}")),
     }
 }
 

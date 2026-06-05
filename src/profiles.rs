@@ -6,6 +6,74 @@ use std::path::{Path, PathBuf};
 const CLAUDE_DIR_NAME: &str = "Claude";
 const MCP_CONFIG_FILE: &str = "claude_desktop_config.json";
 const BACKUPS_DIR_NAME: &str = ".backups";
+const RUN_MODE_FILE: &str = ".run-mode";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RunMode {
+    Switch,
+    MultiInstance,
+}
+
+impl RunMode {
+    fn from_str(s: &str) -> Self {
+        if s.trim() == "multi" {
+            Self::MultiInstance
+        } else {
+            Self::Switch
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Switch => "switch",
+            Self::MultiInstance => "multi",
+        }
+    }
+}
+
+pub fn run_mode() -> RunMode {
+    fs::read_to_string(profiles_dir().join(RUN_MODE_FILE))
+        .map(|s| RunMode::from_str(&s))
+        .unwrap_or(RunMode::Switch)
+}
+
+pub fn set_run_mode(mode: RunMode) {
+    let dir = profiles_dir();
+    let _ = fs::create_dir_all(&dir);
+    let _ = fs::write(dir.join(RUN_MODE_FILE), mode.as_str());
+}
+
+pub fn profile_desktop_path(name: &str) -> PathBuf {
+    platform::profile_desktop_dir(name)
+}
+
+pub fn is_profile_running(name: &str) -> bool {
+    if platform::is_profile_desktop_running(name) {
+        return true;
+    }
+    current_profile().as_deref() == Some(name) && platform::is_default_desktop_running()
+}
+
+pub fn running_profiles() -> Vec<String> {
+    list_profiles()
+        .into_iter()
+        .filter(|p| is_profile_running(p))
+        .collect()
+}
+
+pub fn active_tooltip() -> String {
+    match run_mode() {
+        RunMode::Switch => current_profile().unwrap_or_else(|| "(unmanaged)".into()),
+        RunMode::MultiInstance => {
+            let running = running_profiles();
+            if running.is_empty() {
+                "none running".into()
+            } else {
+                running.join(", ")
+            }
+        }
+    }
+}
 
 pub fn claude_app_dir() -> PathBuf {
     platform::claude_app_dir()
@@ -337,6 +405,156 @@ pub fn after_config_change() {
     {
         platform::kill_claude();
         platform::relaunch_claude();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_code_profile(name: &str) -> Result<(), String> {
+    let dir = code_profile_dir(name);
+    fs::create_dir_all(&dir).map_err(|e| format!("mkdir code profile: {e}"))?;
+
+    let legacy_json = code_profile_json(name);
+    let in_dir_json = dir.join(".claude.json");
+    if !in_dir_json.exists() {
+        if legacy_json.exists() {
+            fs::copy(&legacy_json, &in_dir_json).map_err(|e| format!("migrate code json: {e}"))?;
+        } else {
+            fs::write(&in_dir_json, "{}\n").map_err(|e| format!("init code json: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_code_profile(_name: &str) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn ensure_profile_ready(name: &str) -> Result<(), String> {
+    if !valid_profile_name(name) {
+        return Err("invalid profile name".into());
+    }
+    fs::create_dir_all(profiles_dir()).map_err(|e| format!("mkdir profiles: {e}"))?;
+    fs::create_dir_all(profile_desktop_path(name))
+        .map_err(|e| format!("mkdir desktop profile: {e}"))?;
+    ensure_code_profile(name)
+}
+
+pub fn launch_profile(name: &str) -> Result<(), String> {
+    ensure_profile_ready(name)?;
+    if is_profile_running(name) {
+        return Ok(());
+    }
+    platform::launch_profile_instance(name)
+}
+
+pub fn close_profile(name: &str) {
+    if platform::is_profile_desktop_running(name) {
+        platform::kill_profile_instance(name);
+        return;
+    }
+    if current_profile().as_deref() == Some(name) && platform::is_default_desktop_running() {
+        platform::kill_claude();
+    }
+}
+
+pub fn toggle_profile(name: &str) {
+    if is_profile_running(name) {
+        close_profile(name);
+        platform::notify(&format!("Closed '{name}'"));
+    } else {
+        match launch_profile(name) {
+            Ok(()) => platform::notify(&format!("Launched '{name}'")),
+            Err(e) => platform::notify(&format!("Launch failed: {e}")),
+        }
+    }
+}
+
+pub fn launch_all_profiles() {
+    let profiles = list_profiles();
+    if profiles.is_empty() {
+        platform::notify("No profiles to launch");
+        return;
+    }
+    let mut launched = 0usize;
+    for name in &profiles {
+        if !is_profile_running(name) {
+            if launch_profile(name).is_ok() {
+                launched += 1;
+            }
+        }
+    }
+    if launched == 0 {
+        platform::notify("All profiles already running");
+    } else {
+        platform::notify(&format!("Launched {launched} profile(s)"));
+    }
+}
+
+pub fn close_all_profiles() {
+    if running_profiles().is_empty() && !platform::is_default_desktop_running() {
+        platform::notify("No profiles running");
+        return;
+    }
+    platform::kill_all_profile_instances();
+    if platform::is_default_desktop_running() {
+        platform::kill_claude();
+    }
+    platform::notify("Closed all profiles");
+}
+
+pub fn set_primary_profile(name: &str) -> Result<(), String> {
+    let profiles = profiles_dir();
+    let target = profiles.join(name);
+    if !target.is_dir() {
+        return Err(format!("'{name}' not found"));
+    }
+
+    let app_dir = claude_app_dir();
+    if platform::is_link(&app_dir) {
+        platform::remove_link(&app_dir)?;
+    } else if app_dir.exists() {
+        if app_dir.is_dir() {
+            backup_dir(&app_dir, "primary-set")?;
+        } else {
+            fs::remove_file(&app_dir).ok();
+        }
+    }
+    platform::create_link(&target, &app_dir)?;
+    write_active_marker(name)?;
+
+    #[cfg(target_os = "linux")]
+    if current_code_profile().as_deref() != Some(name) {
+        capture_unmanaged_code(name)?;
+        link_code(name)?;
+    }
+    Ok(())
+}
+
+pub fn toggle_run_mode() -> RunMode {
+    let next = match run_mode() {
+        RunMode::Switch => RunMode::MultiInstance,
+        RunMode::MultiInstance => RunMode::Switch,
+    };
+    if next == RunMode::Switch && !running_profiles().is_empty() {
+        if !platform::confirm(
+            "Switching to single-profile mode will close all running Claude instances. Continue?",
+        ) {
+            return run_mode();
+        }
+        close_all_profiles();
+    }
+    set_run_mode(next);
+    next
+}
+
+pub fn do_new_profile(name: &str, relaunch_after_switch: bool) {
+    match run_mode() {
+        RunMode::Switch => do_switch(name, relaunch_after_switch),
+        RunMode::MultiInstance => match ensure_profile_ready(name) {
+            Ok(()) => toggle_profile(name),
+            Err(e) => platform::notify(&format!("Create failed: {e}")),
+        },
     }
 }
 
