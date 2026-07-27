@@ -75,7 +75,10 @@ Click the tray icon:
 - **Active: \<name\>** — current Desktop profile (read-only header).
 - **Claude Code: \<name\>** — read-only status. `✓` means `~/.claude` is linked to the same profile; `unmanaged` / `out of sync` means it isn't yet.
 - **Link Claude Code → \<active\>** — only shown when Claude Code isn't linked to the active profile. Captures the live `~/.claude` into the active profile and links it, without switching Desktop. Use this once to adopt your current Claude Code config.
-- **\<profile names\>** — click to switch (swaps Desktop **and** Claude Code). The active one is marked `●` and disabled.
+- **\<profile names\>** — in *switch* mode, click to switch (swaps Desktop **and** Claude Code). The active one is marked `●` and disabled.
+- **Switch profiles (one at a time)** / **Multiple instances (side by side)** — choose how profiles run:
+  - *Switch* (default): one profile at a time via symlinks; switching closes Claude.
+  - *Multiple instances*: launch Personal, Work, or both side by side. Each instance gets its own Desktop `userData` dir and (on Linux) its own `CLAUDE_CONFIG_DIR` for the embedded Claude Code agent. Click a profile to open/close it; **Launch all** / **Close all** for bulk control. **Set MCP profile** picks which profile's Desktop MCP config the tray edits (does not close running windows).
 - **MCP servers ▸** — Claude *Desktop* MCP config (`claude_desktop_config.json`). Claude Code's MCP servers live in `~/.claude.json` and are isolated automatically by the profile swap.
   - Lists the current profile's MCP servers.
   - **Import from ▸ \<profile\>** — on Linux, a checklist dialog; on Windows, import all or pick individual servers from a submenu. Selected entries merge into the current config (same-named entries overwrite, but the old config is backed up first).
@@ -83,9 +86,9 @@ Click the tray icon:
   - **Open backups folder (N)** — opens the backups directory.
   - **Clear all MCP servers** — wipes the `mcpServers` map (backed up first).
 - **Memory & skills ▸** (Linux) — the only way Claude Code memory or skills cross from one profile into another. See [Importing memory and skills](#importing-memory-and-skills).
-  - **Import memory from ▸ \<profile\> ▸ \<project\> (N)** — checklist of that profile's memory files for that project.
-  - **Import skills from ▸ \<profile\> (N)** — checklist of that profile's `skills/` entries.
-  - **Check isolation…** — audits the live links and reports anything that would let the active profile see another profile's data.
+  - **Import memory from ▸ \<source\> ▸ \<project\> (N)** — checklist of that profile's memory files for that project. In *multiple instances* mode the entry reads `\<source\> → \<destination\>`, since every profile is live and any of them can be the destination.
+  - **Import skills from ▸ \<source\> (N)** — checklist of that profile's `skills/` entries, with the same source→destination labelling.
+  - **Check isolation…** — audits the live links and reports anything that would let one profile see another's data.
 - **New profile…** — prompts for a name. On first use, this migrates your existing Claude config into a profile.
 - **Rename profile ▸ \<profile\>** — prompts for a new name. Renaming the active profile closes Claude first (with confirmation) and re-points the link; inactive profiles rename in-place without touching Claude.
 - **Relaunch Claude after switch** — toggle. When on, the app is restarted after switching/importing.
@@ -130,12 +133,13 @@ Claude Code keeps memory per project and skills per profile:
     skills/                            → one directory (or symlink) per skill
 ```
 
-Only the active profile sits on a path Claude reads, so an inactive profile's memory and skills are unreachable by default — Claude doesn't load them and doesn't see the directory. **Memory & skills ▸** is the single deliberate exception, and it moves nothing you didn't check in the dialog.
+Each profile only ever sees its own copy — in *switch* mode because the symlinks point elsewhere, in *multiple instances* mode because each window is launched with its own `--user-data-dir` and `CLAUDE_CONFIG_DIR`. Either way another profile's memory and skills are unreachable by default: Claude doesn't load them and doesn't see the directory. **Memory & skills ▸** is the single deliberate exception, and it moves nothing you didn't check in the dialog.
 
 What an import does:
 
 - Copies **only the checked entries**. Nothing else crosses, and the source profile is never modified.
-- Memory lands under the **same project key** in the active profile, so recall keeps working for that working directory.
+- Memory lands under the **same project key** in the destination profile, so recall keeps working for that working directory.
+- The destination is the active profile in *switch* mode. In *multiple instances* mode every profile is live, so the menu names the pair explicitly (`Work → Personal`) and you pick which way it goes.
 - The destination `MEMORY.md` gains a pointer line per imported file — the source's own line, or one built from the file's `name:` / `description:` frontmatter. Existing lines are untouched, and re-importing a file doesn't duplicate its line.
 - Transfers are **content copies, never links**. A skill that was a symlink — including one into a library both profiles share — is dereferenced into a standalone copy, so the source can't influence it after the fact. A dangling symlink is copied verbatim and reported in the notification.
 - Anything an import would overwrite is backed up first.
@@ -146,9 +150,9 @@ Imports are picked up by **new** Claude Code sessions; a session already running
 **Check isolation…** audits the invariant and reports:
 
 - any of `~/.config/Claude`, `~/.claude`, `~/.claude.json` that isn't a link into the active profile — including unmanaged real state left behind by an app update, and
-- any symlink inside the active profile that resolves into a *different* profile.
+- any symlink inside a live profile that resolves into a *different* profile. *Switch* mode checks the active profile; *multiple instances* mode checks them all, since they all run at once.
 
-An empty report means no inactive profile's data is on a path Claude reads.
+An empty report means no other profile's data is on a path Claude reads.
 
 **Windows:**
 
@@ -186,6 +190,7 @@ Backups are timestamped (`<unix-ts>_<profile>_<filename>`) and never auto-pruned
 
 - Closing Claude before switching is required — Electron locks its config dir, and Claude Code holds `~/.claude` open. The switcher kills both automatically (after confirmation if anything was running). **This includes Claude Desktop's embedded agent**, which is a `claude` process using `~/.claude`, so an in-progress agent session ends on switch.
 - Process matching is deliberately narrow so a switch doesn't kill unrelated things: Claude Desktop is matched by the Electron flag `--class=Claude` (plus its `--user-data-dir` helpers and the `claude-desktop` launcher); Claude Code is matched by the **exact** process name `claude`. A shell or editor whose path merely contains "Claude" is left alone.
+- In *multiple instances* mode, each profile is launched with `--user-data-dir=~/.config/claude-profiles/<name>/` and `--class=Claude-<name>`. On Linux, `CLAUDE_CONFIG_DIR=~/.config/claude-code-profiles/<name>/` isolates the embedded agent. Switch-mode instances (via symlink) are not killed when toggling other profiles.
 - Profile dirs are real directories on disk; the active one is reached via the symlinks at `~/.config/Claude`, `~/.claude`, and `~/.claude.json` on Linux, or via junction at `%APPDATA%\Claude` on Windows. Manual edits to either are safe.
 - Isolation is logical, not OS-enforced: all profiles belong to your Unix user, so the guarantee is "the inactive account's data isn't on any path Claude reads," not a permission boundary. **Memory & skills ▸** is the only path across that line, it copies only what you check, and **Check isolation…** verifies the invariant on demand.
 - If a Claude auto-update ever replaces a symlink with a real directory, the next switch treats it as unmanaged state and backs it up before re-linking.

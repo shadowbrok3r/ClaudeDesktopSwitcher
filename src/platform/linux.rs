@@ -1,7 +1,7 @@
 use std::fs;
 use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 pub fn home() -> PathBuf {
@@ -28,6 +28,117 @@ pub fn code_app_json() -> PathBuf {
 
 pub fn code_profiles_dir() -> PathBuf {
     home().join(".config").join("claude-code-profiles")
+}
+
+pub fn profile_desktop_dir(name: &str) -> PathBuf {
+    profiles_dir().join(name)
+}
+
+pub fn profile_code_dir(name: &str) -> PathBuf {
+    code_profiles_dir().join(name)
+}
+
+fn profile_user_data_arg(name: &str) -> String {
+    format!("--user-data-dir={}", profile_desktop_dir(name).display())
+}
+
+pub fn is_profile_desktop_running(name: &str) -> bool {
+    pgrep_hit(&["-f", "--", &profile_user_data_arg(name)])
+}
+
+pub fn is_default_desktop_running() -> bool {
+    is_desktop_running() && !any_named_profile_desktop_running()
+}
+
+fn any_named_profile_desktop_running() -> bool {
+    let Ok(rd) = fs::read_dir(profiles_dir()) else {
+        return false;
+    };
+    for entry in rd.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        if is_profile_desktop_running(name) {
+            return true;
+        }
+    }
+    false
+}
+
+// First Claude Desktop launcher found on PATH.
+fn desktop_binary() -> Option<&'static str> {
+    ["claude-desktop", "Claude"].into_iter().find(|bin| {
+        Command::new("sh")
+            .arg("-c")
+            .arg(format!("command -v {bin}"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
+pub fn launch_profile_instance(name: &str) -> Result<(), String> {
+    let desktop = profile_desktop_dir(name);
+    let code = profile_code_dir(name);
+    fs::create_dir_all(&desktop).map_err(|e| format!("mkdir desktop profile: {e}"))?;
+    fs::create_dir_all(&code).map_err(|e| format!("mkdir code profile: {e}"))?;
+
+    let bin = desktop_binary().ok_or("claude-desktop not found in PATH")?;
+    // Spawn without a shell: avoids quoting bugs (profile names may contain
+    // spaces) and passes the Electron switches directly. No `--` separator —
+    // after `--` Electron treats `--user-data-dir` as a positional arg, which
+    // would silently defeat per-profile isolation. `setsid --fork` reparents the
+    // app to init and exits immediately, so the window outlives the tray and the
+    // wait() below returns at once (just reaping setsid, leaving no zombie).
+    let mut child = Command::new("setsid")
+        .arg("--fork")
+        .arg(bin)
+        .arg(format!("--class=Claude-{name}"))
+        .arg(format!("--user-data-dir={}", desktop.display()))
+        .env("CLAUDE_CONFIG_DIR", &code)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("launch: {e}"))?;
+    let _ = child.wait();
+    Ok(())
+}
+
+pub fn kill_profile_instance(name: &str) {
+    let udd = profile_user_data_arg(name);
+    let _ = Command::new("pkill").args(["-f", "--", &udd]).status();
+    let class = format!("--class=Claude-{name}");
+    let _ = Command::new("pkill").args(["-f", "--", &class]).status();
+    std::thread::sleep(Duration::from_millis(300));
+}
+
+pub fn kill_all_profile_instances() {
+    let Ok(rd) = fs::read_dir(profiles_dir()) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        kill_profile_instance(name);
+    }
 }
 
 pub fn is_link(path: &Path) -> bool {

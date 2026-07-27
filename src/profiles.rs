@@ -6,6 +6,74 @@ use std::path::{Path, PathBuf};
 const CLAUDE_DIR_NAME: &str = "Claude";
 const MCP_CONFIG_FILE: &str = "claude_desktop_config.json";
 const BACKUPS_DIR_NAME: &str = ".backups";
+const RUN_MODE_FILE: &str = ".run-mode";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RunMode {
+    Switch,
+    MultiInstance,
+}
+
+impl RunMode {
+    fn from_str(s: &str) -> Self {
+        if s.trim() == "multi" {
+            Self::MultiInstance
+        } else {
+            Self::Switch
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Switch => "switch",
+            Self::MultiInstance => "multi",
+        }
+    }
+}
+
+pub fn run_mode() -> RunMode {
+    fs::read_to_string(profiles_dir().join(RUN_MODE_FILE))
+        .map(|s| RunMode::from_str(&s))
+        .unwrap_or(RunMode::Switch)
+}
+
+pub fn set_run_mode(mode: RunMode) {
+    let dir = profiles_dir();
+    let _ = fs::create_dir_all(&dir);
+    let _ = fs::write(dir.join(RUN_MODE_FILE), mode.as_str());
+}
+
+pub fn profile_desktop_path(name: &str) -> PathBuf {
+    platform::profile_desktop_dir(name)
+}
+
+pub fn is_profile_running(name: &str) -> bool {
+    if platform::is_profile_desktop_running(name) {
+        return true;
+    }
+    current_profile().as_deref() == Some(name) && platform::is_default_desktop_running()
+}
+
+pub fn running_profiles() -> Vec<String> {
+    list_profiles()
+        .into_iter()
+        .filter(|p| is_profile_running(p))
+        .collect()
+}
+
+pub fn active_tooltip() -> String {
+    match run_mode() {
+        RunMode::Switch => current_profile().unwrap_or_else(|| "(unmanaged)".into()),
+        RunMode::MultiInstance => {
+            let running = running_profiles();
+            if running.is_empty() {
+                "none running".into()
+            } else {
+                running.join(", ")
+            }
+        }
+    }
+}
 
 #[cfg(target_os = "linux")]
 const PROJECTS_DIR_NAME: &str = "projects";
@@ -81,18 +149,6 @@ pub fn current_profile() -> Option<String> {
         return Some(from_link);
     }
     read_active_marker()
-}
-
-pub fn active_tooltip() -> String {
-    let desktop = current_profile().unwrap_or_else(|| "(unmanaged)".into());
-    #[cfg(target_os = "linux")]
-    let out = {
-        let code = current_code_profile().unwrap_or_else(|| "unmanaged".into());
-        format!("Desktop: {desktop}  •  Code: {code}")
-    };
-    #[cfg(not(target_os = "linux"))]
-    let out = format!("Desktop: {desktop}");
-    out
 }
 
 fn dir_is_empty(p: &Path) -> bool {
@@ -367,6 +423,156 @@ pub fn after_config_change() {
     {
         platform::kill_claude();
         platform::relaunch_claude();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_code_profile(name: &str) -> Result<(), String> {
+    let dir = code_profile_dir(name);
+    fs::create_dir_all(&dir).map_err(|e| format!("mkdir code profile: {e}"))?;
+
+    let legacy_json = code_profile_json(name);
+    let in_dir_json = dir.join(".claude.json");
+    if !in_dir_json.exists() {
+        if legacy_json.exists() {
+            fs::copy(&legacy_json, &in_dir_json).map_err(|e| format!("migrate code json: {e}"))?;
+        } else {
+            fs::write(&in_dir_json, "{}\n").map_err(|e| format!("init code json: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_code_profile(_name: &str) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn ensure_profile_ready(name: &str) -> Result<(), String> {
+    if !valid_profile_name(name) {
+        return Err("invalid profile name".into());
+    }
+    fs::create_dir_all(profiles_dir()).map_err(|e| format!("mkdir profiles: {e}"))?;
+    fs::create_dir_all(profile_desktop_path(name))
+        .map_err(|e| format!("mkdir desktop profile: {e}"))?;
+    ensure_code_profile(name)
+}
+
+pub fn launch_profile(name: &str) -> Result<(), String> {
+    ensure_profile_ready(name)?;
+    if is_profile_running(name) {
+        return Ok(());
+    }
+    platform::launch_profile_instance(name)
+}
+
+pub fn close_profile(name: &str) {
+    if platform::is_profile_desktop_running(name) {
+        platform::kill_profile_instance(name);
+        return;
+    }
+    if current_profile().as_deref() == Some(name) && platform::is_default_desktop_running() {
+        platform::kill_claude();
+    }
+}
+
+pub fn toggle_profile(name: &str) {
+    if is_profile_running(name) {
+        close_profile(name);
+        platform::notify(&format!("Closed '{name}'"));
+    } else {
+        match launch_profile(name) {
+            Ok(()) => platform::notify(&format!("Launched '{name}'")),
+            Err(e) => platform::notify(&format!("Launch failed: {e}")),
+        }
+    }
+}
+
+pub fn launch_all_profiles() {
+    let profiles = list_profiles();
+    if profiles.is_empty() {
+        platform::notify("No profiles to launch");
+        return;
+    }
+    let mut launched = 0usize;
+    for name in &profiles {
+        if !is_profile_running(name) {
+            if launch_profile(name).is_ok() {
+                launched += 1;
+            }
+        }
+    }
+    if launched == 0 {
+        platform::notify("All profiles already running");
+    } else {
+        platform::notify(&format!("Launched {launched} profile(s)"));
+    }
+}
+
+pub fn close_all_profiles() {
+    if running_profiles().is_empty() && !platform::is_default_desktop_running() {
+        platform::notify("No profiles running");
+        return;
+    }
+    platform::kill_all_profile_instances();
+    if platform::is_default_desktop_running() {
+        platform::kill_claude();
+    }
+    platform::notify("Closed all profiles");
+}
+
+pub fn set_primary_profile(name: &str) -> Result<(), String> {
+    let profiles = profiles_dir();
+    let target = profiles.join(name);
+    if !target.is_dir() {
+        return Err(format!("'{name}' not found"));
+    }
+
+    let app_dir = claude_app_dir();
+    if platform::is_link(&app_dir) {
+        platform::remove_link(&app_dir)?;
+    } else if app_dir.exists() {
+        if app_dir.is_dir() {
+            backup_dir(&app_dir, "primary-set")?;
+        } else {
+            fs::remove_file(&app_dir).ok();
+        }
+    }
+    platform::create_link(&target, &app_dir)?;
+    write_active_marker(name)?;
+
+    #[cfg(target_os = "linux")]
+    if current_code_profile().as_deref() != Some(name) {
+        capture_unmanaged_code(name)?;
+        link_code(name)?;
+    }
+    Ok(())
+}
+
+pub fn toggle_run_mode() -> RunMode {
+    let next = match run_mode() {
+        RunMode::Switch => RunMode::MultiInstance,
+        RunMode::MultiInstance => RunMode::Switch,
+    };
+    if next == RunMode::Switch && !running_profiles().is_empty() {
+        if !platform::confirm(
+            "Switching to single-profile mode will close all running Claude instances. Continue?",
+        ) {
+            return run_mode();
+        }
+        close_all_profiles();
+    }
+    set_run_mode(next);
+    next
+}
+
+pub fn do_new_profile(name: &str, relaunch_after_switch: bool) {
+    match run_mode() {
+        RunMode::Switch => do_switch(name, relaunch_after_switch),
+        RunMode::MultiInstance => match ensure_profile_ready(name) {
+            Ok(()) => toggle_profile(name),
+            Err(e) => platform::notify(&format!("Create failed: {e}")),
+        },
     }
 }
 
@@ -873,18 +1079,22 @@ fn log_import(source: &str, dest: &str, what: &str) {
 }
 
 // Copy the named memory files from `source`'s `project` into the same project key
-// under the active profile, so recall keeps working for that working directory.
+// under `dest`, so recall keeps working for that working directory.
 #[cfg(target_os = "linux")]
-pub fn import_memory(source: &str, project: &str, files: &[String]) -> Result<usize, String> {
-    let active = current_profile().ok_or("no active profile")?;
-    if source == active {
-        return Err("source is the active profile".into());
+pub fn import_memory(
+    source: &str,
+    dest: &str,
+    project: &str,
+    files: &[String],
+) -> Result<usize, String> {
+    if source == dest {
+        return Err("source and destination are the same profile".into());
     }
-    if !is_plain_name(source) || !is_plain_name(project) {
-        return Err("bad source or project name".into());
+    if !is_plain_name(source) || !is_plain_name(dest) || !is_plain_name(project) {
+        return Err("bad source, destination or project name".into());
     }
     let src_dir = code_memory_dir(source, project);
-    let dst_dir = code_memory_dir(&active, project);
+    let dst_dir = code_memory_dir(dest, project);
     fs::create_dir_all(&dst_dir).map_err(|e| format!("mkdir memory: {e}"))?;
 
     let mut copied = Vec::new();
@@ -903,7 +1113,7 @@ pub fn import_memory(source: &str, project: &str, files: &[String]) -> Result<us
         merge_memory_index(&dst_dir, &src_dir, &copied)?;
         log_import(
             source,
-            &active,
+            dest,
             &format!("memory {project}: {}", copied.join(" ")),
         );
     }
@@ -912,16 +1122,15 @@ pub fn import_memory(source: &str, project: &str, files: &[String]) -> Result<us
 
 // Returns (copied, dangling-links-copied-as-is).
 #[cfg(target_os = "linux")]
-pub fn import_skills(source: &str, names: &[String]) -> Result<(usize, usize), String> {
-    let active = current_profile().ok_or("no active profile")?;
-    if source == active {
-        return Err("source is the active profile".into());
+pub fn import_skills(source: &str, dest: &str, names: &[String]) -> Result<(usize, usize), String> {
+    if source == dest {
+        return Err("source and destination are the same profile".into());
     }
-    if !is_plain_name(source) {
-        return Err("bad source name".into());
+    if !is_plain_name(source) || !is_plain_name(dest) {
+        return Err("bad source or destination name".into());
     }
     let src_dir = code_skills_dir(source);
-    let dst_dir = code_skills_dir(&active);
+    let dst_dir = code_skills_dir(dest);
     fs::create_dir_all(&dst_dir).map_err(|e| format!("mkdir skills: {e}"))?;
 
     let mut copied = Vec::new();
@@ -941,7 +1150,7 @@ pub fn import_skills(source: &str, names: &[String]) -> Result<(usize, usize), S
         copied.push(n.clone());
     }
     if !copied.is_empty() {
-        log_import(source, &active, &format!("skills: {}", copied.join(" ")));
+        log_import(source, dest, &format!("skills: {}", copied.join(" ")));
     }
     Ok((copied.len(), dangling))
 }
@@ -1009,21 +1218,38 @@ fn scan_escapes(dir: &Path, active: &str, out: &mut Vec<String>, depth: usize, b
     }
 }
 
-// Every way the active profile could still see another profile's data. Empty
-// means isolated.
+// Every way a live profile could still see another profile's data. Empty means
+// isolated.
 #[cfg(target_os = "linux")]
 pub fn audit_isolation() -> Vec<String> {
-    let Some(active) = current_profile() else {
-        return vec!["No active profile — Claude's config is unmanaged.".into()];
-    };
+    let multi = run_mode() == RunMode::MultiInstance;
+    let active = current_profile();
     let mut out = Vec::new();
-    check_live_link(&claude_app_dir(), "~/.config/Claude", &active, &mut out);
-    check_live_link(&platform::code_app_dir(), "~/.claude", &active, &mut out);
-    check_live_link(&platform::code_app_json(), "~/.claude.json", &active, &mut out);
 
+    match &active {
+        Some(active) => {
+            check_live_link(&claude_app_dir(), "~/.config/Claude", active, &mut out);
+            check_live_link(&platform::code_app_dir(), "~/.claude", active, &mut out);
+            check_live_link(&platform::code_app_json(), "~/.claude.json", active, &mut out);
+        }
+        // In multi-instance mode the live links only serve the MCP profile;
+        // instances reach their dirs by flag and CLAUDE_CONFIG_DIR instead.
+        None if !multi => return vec!["No active profile — Claude's config is unmanaged.".into()],
+        None => {}
+    }
+
+    // Multi-instance runs every profile at once, so each has to stay inside its
+    // own tree; switching leaves only the active one reachable.
+    let scanned: Vec<String> = if multi {
+        list_profiles()
+    } else {
+        active.into_iter().collect()
+    };
     let mut budget = SCAN_MAX_ENTRIES;
-    for root in [code_profile_dir(&active), profiles_dir().join(&active)] {
-        scan_escapes(&root, &active, &mut out, SCAN_MAX_DEPTH, &mut budget);
+    for name in &scanned {
+        for root in [code_profile_dir(name), profiles_dir().join(name)] {
+            scan_escapes(&root, name, &mut out, SCAN_MAX_DEPTH, &mut budget);
+        }
     }
     if budget == 0 {
         out.push(format!(
@@ -1036,7 +1262,7 @@ pub fn audit_isolation() -> Vec<String> {
 // ── Menu actions (Linux only) ────────────────────────────────────────────────
 
 #[cfg(target_os = "linux")]
-pub fn import_memory_from(source: &str, project: &str) {
+pub fn import_memory_from(source: &str, dest: &str, project: &str) {
     let files = list_memory_files(source, project);
     if files.is_empty() {
         platform::notify(&format!(
@@ -1047,7 +1273,7 @@ pub fn import_memory_from(source: &str, project: &str) {
     }
     let Some(picks) = platform::pick_items(
         &format!(
-            "Copy memory from '{source}' into the active profile for {}.\n\
+            "Copy memory from '{source}' into '{dest}' for {}.\n\
              Only what you check is copied — the rest of '{source}' stays out of reach.",
             project_label(project)
         ),
@@ -1055,16 +1281,16 @@ pub fn import_memory_from(source: &str, project: &str) {
     ) else {
         return;
     };
-    match import_memory(source, project, &picks) {
+    match import_memory(source, dest, project, &picks) {
         Ok(n) => platform::notify(&format!(
-            "Imported {n} memory file(s) from '{source}' — picked up by new Claude Code sessions"
+            "Imported {n} memory file(s) '{source}' → '{dest}' — picked up by new Claude Code sessions"
         )),
         Err(e) => platform::notify(&format!("Memory import failed: {e}")),
     }
 }
 
 #[cfg(target_os = "linux")]
-pub fn import_skills_from(source: &str) {
+pub fn import_skills_from(source: &str, dest: &str) {
     let skills = list_code_skills(source);
     if skills.is_empty() {
         platform::notify(&format!("'{source}' has no skills"));
@@ -1072,19 +1298,19 @@ pub fn import_skills_from(source: &str) {
     }
     let Some(picks) = platform::pick_items(
         &format!(
-            "Copy skills from '{source}' into the active profile.\n\
+            "Copy skills from '{source}' into '{dest}'.\n\
              Only what you check is copied — the rest of '{source}' stays out of reach."
         ),
         &skills,
     ) else {
         return;
     };
-    match import_skills(source, &picks) {
+    match import_skills(source, dest, &picks) {
         Ok((n, 0)) => platform::notify(&format!(
-            "Imported {n} skill(s) from '{source}' — picked up by new Claude Code sessions"
+            "Imported {n} skill(s) '{source}' → '{dest}' — picked up by new Claude Code sessions"
         )),
         Ok((n, d)) => platform::notify(&format!(
-            "Imported {n} skill(s) from '{source}' — {d} dangling symlink(s) copied as-is"
+            "Imported {n} skill(s) '{source}' → '{dest}' — {d} dangling symlink(s) copied as-is"
         )),
         Err(e) => platform::notify(&format!("Skill import failed: {e}")),
     }
@@ -1093,11 +1319,15 @@ pub fn import_skills_from(source: &str) {
 #[cfg(target_os = "linux")]
 pub fn show_isolation_report() {
     let findings = audit_isolation();
+    let scope = match run_mode() {
+        RunMode::Switch => "the active profile",
+        RunMode::MultiInstance => "every profile",
+    };
     let body = if findings.is_empty() {
         format!(
             "Isolation OK.\n\n\
              ~/.config/Claude, ~/.claude and ~/.claude.json all resolve inside the active \
-             profile, and nothing inside it links into another profile.\n\n\
+             profile, and nothing inside {scope} links into another profile.\n\n\
              Imports are content copies, logged to:\n{}",
             platform::code_profiles_dir().join(IMPORT_LOG_FILE).display()
         )
@@ -1182,7 +1412,7 @@ mod tests {
         assert_eq!(project_label(&format!("{home_key}-proj")), "~/proj");
         assert_eq!(project_label("-home-user-proj"), "-home-user-proj");
 
-        assert_eq!(import_memory("Src", KEY, &["a.md".into()]).unwrap(), 1);
+        assert_eq!(import_memory("Src", "Dst", KEY, &["a.md".into()]).unwrap(), 1);
         let dst_mem = code.join("Dst").join("projects").join(KEY).join("memory");
         assert_eq!(fs::read_to_string(dst_mem.join("a.md")).unwrap(), "---\nname: alpha\n---\n\nalpha body\n");
         assert!(!is_symlink(&dst_mem.join("a.md")), "import must be a copy, not a link");
@@ -1194,12 +1424,12 @@ mod tests {
         assert!(!index.contains("(b.md)"));
 
         // Re-importing the same file must not duplicate its index line.
-        assert_eq!(import_memory("Src", KEY, &["a.md".into()]).unwrap(), 1);
+        assert_eq!(import_memory("Src", "Dst", KEY, &["a.md".into()]).unwrap(), 1);
         let index = fs::read_to_string(dst_mem.join(MEMORY_INDEX_FILE)).unwrap();
         assert_eq!(index.matches("(a.md)").count(), 1);
 
         let picks = ["plain".into(), "linked".into(), "broken".into()];
-        assert_eq!(import_skills("Src", &picks).unwrap(), (3, 1));
+        assert_eq!(import_skills("Src", "Dst", &picks).unwrap(), (3, 1));
         let dst_skills = code.join("Dst").join(SKILLS_DIR_NAME);
         assert_eq!(fs::read_to_string(dst_skills.join("plain").join("SKILL.md")).unwrap(), "plain skill\n");
         assert!(!is_symlink(&dst_skills.join("plain")));
@@ -1207,7 +1437,7 @@ mod tests {
         assert_eq!(fs::read_to_string(dst_skills.join("linked").join("SKILL.md")).unwrap(), "shared skill\n");
         assert!(is_symlink(&dst_skills.join("broken")), "a dangling link is carried over as-is");
 
-        assert!(import_memory("Dst", KEY, &["a.md".into()]).is_err());
+        assert!(import_memory("Dst", "Dst", KEY, &["a.md".into()]).is_err());
         assert_eq!(audit_isolation(), Vec::<String>::new());
 
         unix_fs::symlink(
@@ -1218,6 +1448,20 @@ mod tests {
         let findings = audit_isolation();
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert!(findings[0].contains("reaches into profile 'Src'"));
+
+        // Switch mode only reaches the active profile; multi-instance runs them
+        // all, so a leak out of an inactive profile has to surface too.
+        unix_fs::symlink(
+            code.join("Dst").join(SKILLS_DIR_NAME).join("plain"),
+            code.join("Src").join(SKILLS_DIR_NAME).join("leak-back"),
+        )
+        .unwrap();
+        assert_eq!(audit_isolation().len(), 1);
+        set_run_mode(RunMode::MultiInstance);
+        let findings = audit_isolation();
+        assert_eq!(findings.len(), 2, "{findings:?}");
+        assert!(findings.iter().any(|f| f.contains("reaches into profile 'Dst'")));
+        set_run_mode(RunMode::Switch);
 
         fs::remove_dir_all(&home).ok();
     }

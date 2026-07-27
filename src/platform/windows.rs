@@ -44,6 +44,131 @@ pub fn profiles_dir() -> PathBuf {
         .unwrap_or_else(|| home().join("AppData").join("Roaming").join("claude-profiles"))
 }
 
+pub fn profile_desktop_dir(name: &str) -> PathBuf {
+    profiles_dir().join(name)
+}
+
+fn profile_dir_pattern(name: &str) -> String {
+    profile_desktop_dir(name)
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('\'', "''")
+}
+
+pub fn is_profile_desktop_running(name: &str) -> bool {
+    let needle = profile_dir_pattern(name);
+    let ps = format!(
+        r#"
+$needle = '{needle}'
+Get-CimInstance Win32_Process -Filter "Name='claude.exe'" -ErrorAction SilentlyContinue |
+  Where-Object {{ $_.CommandLine -and $_.CommandLine -like "*$needle*" }} |
+  Select-Object -First 1 | ForEach-Object {{ exit 0 }}
+exit 1
+"#
+    );
+    Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+pub fn is_default_desktop_running() -> bool {
+    is_claude_running() && !any_named_profile_desktop_running()
+}
+
+fn any_named_profile_desktop_running() -> bool {
+    let Ok(rd) = fs::read_dir(profiles_dir()) else {
+        return false;
+    };
+    for entry in rd.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        if is_profile_desktop_running(name) {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn launch_profile_instance(name: &str) -> Result<(), String> {
+    let desktop = profile_desktop_dir(name);
+    fs::create_dir_all(&desktop).map_err(|e| format!("mkdir desktop profile: {e}"))?;
+    let dir = desktop.display().to_string().replace('\'', "''");
+    let ps = format!(
+        r#"
+$dir = '{dir}'
+$running = Get-CimInstance Win32_Process -Filter "Name='claude.exe'" -ErrorAction SilentlyContinue |
+  Where-Object {{ $_.CommandLine -and $_.CommandLine -like "*$dir*" }}
+if ($running) {{ exit 0 }}
+$exe = Join-Path $env:LOCALAPPDATA 'Programs\Claude\Claude.exe'
+if (Test-Path $exe) {{
+  Start-Process $exe -ArgumentList "--user-data-dir=$dir"
+  exit 0
+}}
+$app = Get-StartApps | Where-Object {{ $_.Name -eq 'Claude' }} | Select-Object -First 1
+if ($app) {{
+  Start-Process explorer.exe "shell:AppsFolder\$($app.AppID)" -ArgumentList "--user-data-dir=$dir"
+  exit 0
+}}
+exit 1
+"#
+    );
+    let ok = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if ok {
+        Ok(())
+    } else {
+        Err("failed to launch Claude".into())
+    }
+}
+
+pub fn kill_profile_instance(name: &str) {
+    let needle = profile_dir_pattern(name);
+    let ps = format!(
+        r#"
+$needle = '{needle}'
+Get-CimInstance Win32_Process -Filter "Name='claude.exe'" -ErrorAction SilentlyContinue |
+  Where-Object {{ $_.CommandLine -and $_.CommandLine -like "*$needle*" }} |
+  ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}
+"#
+    );
+    let _ = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+        .status();
+    std::thread::sleep(Duration::from_millis(300));
+}
+
+pub fn kill_all_profile_instances() {
+    let Ok(rd) = fs::read_dir(profiles_dir()) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        kill_profile_instance(name);
+    }
+}
+
 pub fn is_link(path: &Path) -> bool {
     fs::symlink_metadata(path)
         .map(|m| m.file_type().is_symlink())
