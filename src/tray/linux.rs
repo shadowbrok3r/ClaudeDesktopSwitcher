@@ -124,6 +124,142 @@ impl App {
         }
         .into()
     }
+
+    // One source profile's memory, grouped by project key.
+    fn memory_source_submenu(&self, source: &str) -> MenuItem<Self> {
+        let projects = profiles::list_memory_projects(source);
+        let items: Vec<MenuItem<Self>> = if projects.is_empty() {
+            vec![
+                StandardItem {
+                    label: "(no memory)".into(),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+            ]
+        } else {
+            projects
+                .iter()
+                .map(|project| {
+                    let count = profiles::list_memory_files(source, project).len();
+                    let src = source.to_string();
+                    let key = project.clone();
+                    StandardItem {
+                        label: format!("{} ({count})", profiles::project_label(project)),
+                        activate: Box::new(move |_: &mut Self| {
+                            profiles::import_memory_from(&src, &key);
+                        }),
+                        ..Default::default()
+                    }
+                    .into()
+                })
+                .collect()
+        };
+        SubMenu {
+            label: source.to_string(),
+            submenu: items,
+            enabled: !projects.is_empty(),
+            ..Default::default()
+        }
+        .into()
+    }
+
+    fn memory_submenu(&self, current_profile_name: &Option<String>) -> MenuItem<Self> {
+        let sources = profiles::import_sources(current_profile_name.as_deref());
+        let mut sub: Vec<MenuItem<Self>> = Vec::new();
+
+        sub.push(
+            StandardItem {
+                label: "Nothing crosses profiles until imported here".into(),
+                enabled: false,
+                ..Default::default()
+            }
+            .into(),
+        );
+        sub.push(
+            StandardItem {
+                label: "Imports are copies, not links".into(),
+                enabled: false,
+                ..Default::default()
+            }
+            .into(),
+        );
+        sub.push(MenuItem::Separator);
+
+        if current_profile_name.is_none() {
+            sub.push(
+                StandardItem {
+                    label: "(no active profile to import into)".into(),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+            );
+        } else if sources.is_empty() {
+            sub.push(
+                StandardItem {
+                    label: "(no other profiles)".into(),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+            );
+        } else {
+            sub.push(
+                SubMenu {
+                    label: "Import memory from".into(),
+                    submenu: sources
+                        .iter()
+                        .map(|s| self.memory_source_submenu(s))
+                        .collect(),
+                    ..Default::default()
+                }
+                .into(),
+            );
+
+            let skill_items: Vec<MenuItem<Self>> = sources
+                .iter()
+                .map(|s| {
+                    let count = profiles::list_code_skills(s).len();
+                    let src = s.clone();
+                    StandardItem {
+                        label: format!("{s} ({count})"),
+                        enabled: count > 0,
+                        activate: Box::new(move |_: &mut Self| {
+                            profiles::import_skills_from(&src);
+                        }),
+                        ..Default::default()
+                    }
+                    .into()
+                })
+                .collect();
+            sub.push(
+                SubMenu {
+                    label: "Import skills from".into(),
+                    submenu: skill_items,
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+
+        sub.push(MenuItem::Separator);
+        sub.push(
+            StandardItem {
+                label: "Check isolation…".into(),
+                activate: Box::new(|_| profiles::show_isolation_report()),
+                ..Default::default()
+            }
+            .into(),
+        );
+
+        SubMenu {
+            label: "Memory & skills".into(),
+            submenu: sub,
+            ..Default::default()
+        }
+        .into()
+    }
 }
 
 impl Tray for App {
@@ -137,11 +273,9 @@ impl Tray for App {
         "system-switch-user".into()
     }
     fn tool_tip(&self) -> ksni::ToolTip {
-        let cur = profiles::current_profile().unwrap_or_else(|| "(unmanaged)".into());
-        let code = profiles::current_code_profile().unwrap_or_else(|| "unmanaged".into());
         ksni::ToolTip {
             title: "Claude Switcher".into(),
-            description: format!("Desktop: {cur}  •  Code: {code}"),
+            description: profiles::active_tooltip(),
             icon_name: "system-switch-user".into(),
             icon_pixmap: vec![],
         }
@@ -231,6 +365,7 @@ impl Tray for App {
 
         items.push(MenuItem::Separator);
         items.push(self.mcp_submenu(&current));
+        items.push(self.memory_submenu(&current));
 
         items.push(MenuItem::Separator);
         items.push(

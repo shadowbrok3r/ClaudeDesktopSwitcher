@@ -7,6 +7,24 @@ const CLAUDE_DIR_NAME: &str = "Claude";
 const MCP_CONFIG_FILE: &str = "claude_desktop_config.json";
 const BACKUPS_DIR_NAME: &str = ".backups";
 
+#[cfg(target_os = "linux")]
+const PROJECTS_DIR_NAME: &str = "projects";
+#[cfg(target_os = "linux")]
+const MEMORY_DIR_NAME: &str = "memory";
+#[cfg(target_os = "linux")]
+const MEMORY_INDEX_FILE: &str = "MEMORY.md";
+#[cfg(target_os = "linux")]
+const SKILLS_DIR_NAME: &str = "skills";
+#[cfg(target_os = "linux")]
+const IMPORT_LOG_FILE: &str = ".imports.log";
+#[cfg(target_os = "linux")]
+const COPY_MAX_DEPTH: usize = 32;
+#[cfg(target_os = "linux")]
+const SCAN_MAX_DEPTH: usize = 24;
+// A Desktop profile's Electron caches run to tens of thousands of entries.
+#[cfg(target_os = "linux")]
+const SCAN_MAX_ENTRIES: usize = 200_000;
+
 pub fn claude_app_dir() -> PathBuf {
     platform::claude_app_dir()
 }
@@ -63,6 +81,18 @@ pub fn current_profile() -> Option<String> {
         return Some(from_link);
     }
     read_active_marker()
+}
+
+pub fn active_tooltip() -> String {
+    let desktop = current_profile().unwrap_or_else(|| "(unmanaged)".into());
+    #[cfg(target_os = "linux")]
+    let out = {
+        let code = current_code_profile().unwrap_or_else(|| "unmanaged".into());
+        format!("Desktop: {desktop}  •  Code: {code}")
+    };
+    #[cfg(not(target_os = "linux"))]
+    let out = format!("Desktop: {desktop}");
+    out
 }
 
 fn dir_is_empty(p: &Path) -> bool {
@@ -607,4 +637,588 @@ pub fn rename_code_profile(old: &str, new: &str, active: bool) -> Result<(), Str
         }
     }
     Ok(())
+}
+
+// ── Cross-profile memory / skills import (Linux only) ────────────────────────
+//
+// Profiles are isolated by the symlink swap: nothing in an inactive profile sits
+// on a path Claude reads. These functions are the only bridge across that line.
+// They run only from an explicit menu pick, transfer only the entries checked in
+// the dialog, and always write *content copies* — never links — so an import is
+// a snapshot the source profile can no longer influence.
+
+#[cfg(target_os = "linux")]
+fn code_projects_dir(profile: &str) -> PathBuf {
+    code_profile_dir(profile).join(PROJECTS_DIR_NAME)
+}
+
+#[cfg(target_os = "linux")]
+fn code_memory_dir(profile: &str, project: &str) -> PathBuf {
+    code_projects_dir(profile).join(project).join(MEMORY_DIR_NAME)
+}
+
+#[cfg(target_os = "linux")]
+fn code_skills_dir(profile: &str) -> PathBuf {
+    code_profile_dir(profile).join(SKILLS_DIR_NAME)
+}
+
+// Rejects names that would escape the directory they were listed from.
+#[cfg(target_os = "linux")]
+fn is_plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+}
+
+#[cfg(target_os = "linux")]
+fn entry_names(dir: &Path, keep: impl Fn(&Path, &str) -> bool) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(rd) = fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || !is_plain_name(&name) {
+                continue;
+            }
+            if keep(&e.path(), &name) {
+                out.push(name);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[cfg(target_os = "linux")]
+pub fn list_memory_files(profile: &str, project: &str) -> Vec<String> {
+    entry_names(&code_memory_dir(profile, project), |p, name| {
+        name != MEMORY_INDEX_FILE && name.ends_with(".md") && p.is_file()
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub fn list_memory_projects(profile: &str) -> Vec<String> {
+    entry_names(&code_projects_dir(profile), |p, _| {
+        p.join(MEMORY_DIR_NAME).is_dir()
+    })
+    .into_iter()
+    .filter(|project| !list_memory_files(profile, project).is_empty())
+    .collect()
+}
+
+#[cfg(target_os = "linux")]
+pub fn list_code_skills(profile: &str) -> Vec<String> {
+    entry_names(&code_skills_dir(profile), |_, _| true)
+}
+
+// Profiles that can be imported from: Desktop and Claude Code profile dirs,
+// minus `exclude` (the active one).
+#[cfg(target_os = "linux")]
+pub fn import_sources(exclude: Option<&str>) -> Vec<String> {
+    let mut out = list_profiles();
+    out.extend(entry_names(&platform::code_profiles_dir(), |p, _| p.is_dir()));
+    out.sort();
+    out.dedup();
+    out.retain(|p| Some(p.as_str()) != exclude);
+    out
+}
+
+// Claude Code project keys are the project path with every '/' turned into '-'.
+#[cfg(target_os = "linux")]
+pub fn project_label(key: &str) -> String {
+    let home_key = platform::home().to_string_lossy().replace('/', "-");
+    match key.strip_prefix(&home_key) {
+        Some(rest) => format!("~{}", rest.replacen('-', "/", 1)),
+        None => key.to_string(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn write_text(path: &Path, s: &str) -> Result<(), String> {
+    let tmp = path.with_extension("md.tmp");
+    fs::write(&tmp, s).map_err(|e| format!("write tmp: {e}"))?;
+    fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))
+}
+
+// The source index's pointer line for `file`, else one built from its frontmatter.
+#[cfg(target_os = "linux")]
+fn index_line_for(src_index: &str, file: &str, body: &str) -> String {
+    let needle = format!("]({file})");
+    if let Some(line) = src_index.lines().find(|l| l.contains(&needle)) {
+        return line.trim_end().to_string();
+    }
+    let mut title = file.trim_end_matches(".md").to_string();
+    let mut hook = String::new();
+    for line in body.lines().take(12) {
+        if let Some(v) = line.strip_prefix("name:") {
+            title = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("description:") {
+            hook = v.trim().to_string();
+        }
+    }
+    if hook.is_empty() {
+        format!("- [{title}]({file})")
+    } else {
+        format!("- [{title}]({file}) — {hook}")
+    }
+}
+
+// Append pointer lines for the imported files to the destination MEMORY.md,
+// leaving lines already there untouched.
+#[cfg(target_os = "linux")]
+fn merge_memory_index(dst_dir: &Path, src_dir: &Path, files: &[String]) -> Result<(), String> {
+    let src_index = fs::read_to_string(src_dir.join(MEMORY_INDEX_FILE)).unwrap_or_default();
+    let dst_path = dst_dir.join(MEMORY_INDEX_FILE);
+    let mut dst = fs::read_to_string(&dst_path).unwrap_or_default();
+
+    let added: Vec<String> = files
+        .iter()
+        .filter(|f| !dst.contains(&format!("]({f})")))
+        .map(|f| {
+            let body = fs::read_to_string(dst_dir.join(f)).unwrap_or_default();
+            index_line_for(&src_index, f, &body)
+        })
+        .collect();
+    if added.is_empty() {
+        return Ok(());
+    }
+
+    backup_file(&dst_path, "memory-import")?;
+    if dst.trim().is_empty() {
+        dst = "# Memory\n\n".into();
+    } else if !dst.ends_with('\n') {
+        dst.push('\n');
+    }
+    dst.push_str(&added.join("\n"));
+    dst.push('\n');
+    write_text(&dst_path, &dst)
+}
+
+// Content copy. Symlinks are dereferenced so an imported entry never points back
+// into the source profile or a library both profiles share; a dangling link is
+// carried over verbatim.
+#[cfg(target_os = "linux")]
+fn copy_tree(src: &Path, dst: &Path, depth: usize) -> Result<(), String> {
+    use std::os::unix::fs as unix_fs;
+
+    if depth == 0 {
+        return Err(format!("nesting too deep at {}", src.display()));
+    }
+    let meta = fs::symlink_metadata(src).map_err(|e| format!("stat {}: {e}", src.display()))?;
+    if meta.file_type().is_symlink() {
+        return match fs::canonicalize(src) {
+            Ok(real) => copy_tree(&real, dst, depth - 1),
+            Err(_) => {
+                let target =
+                    fs::read_link(src).map_err(|e| format!("readlink {}: {e}", src.display()))?;
+                unix_fs::symlink(target, dst)
+                    .map_err(|e| format!("symlink {}: {e}", dst.display()))
+            }
+        };
+    }
+    if meta.is_dir() {
+        fs::create_dir_all(dst).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
+        for e in fs::read_dir(src)
+            .map_err(|e| format!("read {}: {e}", src.display()))?
+            .flatten()
+        {
+            copy_tree(&e.path(), &dst.join(e.file_name()), depth - 1)?;
+        }
+        return Ok(());
+    }
+    fs::copy(src, dst)
+        .map(|_| ())
+        .map_err(|e| format!("copy {}: {e}", src.display()))
+}
+
+// Back up whatever sits at `dst`, drop it, and put a content copy of `src` there.
+// A link at `dst` is only unlinked — its target belongs to something else.
+#[cfg(target_os = "linux")]
+fn replace_with_copy(src: &Path, dst: &Path, label: &str) -> Result<(), String> {
+    match fs::symlink_metadata(dst) {
+        Ok(m) if m.file_type().is_symlink() => {
+            fs::remove_file(dst).map_err(|e| format!("unlink {}: {e}", dst.display()))?;
+        }
+        Ok(m) if m.is_dir() => {
+            backup_dir(dst, label)?;
+        }
+        Ok(_) => {
+            backup_file(dst, label)?;
+            fs::remove_file(dst).ok();
+        }
+        Err(_) => {}
+    }
+    copy_tree(src, dst, COPY_MAX_DEPTH)
+}
+
+#[cfg(target_os = "linux")]
+fn is_dangling(p: &Path) -> bool {
+    fs::symlink_metadata(p)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+        && fs::canonicalize(p).is_err()
+}
+
+// Logged outside every profile dir, so the log is not on a path Claude reads.
+#[cfg(target_os = "linux")]
+fn log_import(source: &str, dest: &str, what: &str) {
+    use std::io::Write;
+
+    let path = platform::code_profiles_dir().join(IMPORT_LOG_FILE);
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{} {source} -> {dest}: {what}", timestamp());
+    }
+}
+
+// Copy the named memory files from `source`'s `project` into the same project key
+// under the active profile, so recall keeps working for that working directory.
+#[cfg(target_os = "linux")]
+pub fn import_memory(source: &str, project: &str, files: &[String]) -> Result<usize, String> {
+    let active = current_profile().ok_or("no active profile")?;
+    if source == active {
+        return Err("source is the active profile".into());
+    }
+    if !is_plain_name(source) || !is_plain_name(project) {
+        return Err("bad source or project name".into());
+    }
+    let src_dir = code_memory_dir(source, project);
+    let dst_dir = code_memory_dir(&active, project);
+    fs::create_dir_all(&dst_dir).map_err(|e| format!("mkdir memory: {e}"))?;
+
+    let mut copied = Vec::new();
+    for f in files {
+        if !is_plain_name(f) {
+            continue;
+        }
+        let src = src_dir.join(f);
+        if !src.is_file() {
+            continue;
+        }
+        replace_with_copy(&src, &dst_dir.join(f), "memory-import")?;
+        copied.push(f.clone());
+    }
+    if !copied.is_empty() {
+        merge_memory_index(&dst_dir, &src_dir, &copied)?;
+        log_import(
+            source,
+            &active,
+            &format!("memory {project}: {}", copied.join(" ")),
+        );
+    }
+    Ok(copied.len())
+}
+
+// Returns (copied, dangling-links-copied-as-is).
+#[cfg(target_os = "linux")]
+pub fn import_skills(source: &str, names: &[String]) -> Result<(usize, usize), String> {
+    let active = current_profile().ok_or("no active profile")?;
+    if source == active {
+        return Err("source is the active profile".into());
+    }
+    if !is_plain_name(source) {
+        return Err("bad source name".into());
+    }
+    let src_dir = code_skills_dir(source);
+    let dst_dir = code_skills_dir(&active);
+    fs::create_dir_all(&dst_dir).map_err(|e| format!("mkdir skills: {e}"))?;
+
+    let mut copied = Vec::new();
+    let mut dangling = 0;
+    for n in names {
+        if !is_plain_name(n) {
+            continue;
+        }
+        let src = src_dir.join(n);
+        if fs::symlink_metadata(&src).is_err() {
+            continue;
+        }
+        if is_dangling(&src) {
+            dangling += 1;
+        }
+        replace_with_copy(&src, &dst_dir.join(n), "skill-import")?;
+        copied.push(n.clone());
+    }
+    if !copied.is_empty() {
+        log_import(source, &active, &format!("skills: {}", copied.join(" ")));
+    }
+    Ok((copied.len(), dangling))
+}
+
+// ── Isolation audit (Linux only) ─────────────────────────────────────────────
+
+// Name of the profile `target` lives under, if any.
+#[cfg(target_os = "linux")]
+fn owning_profile(target: &Path) -> Option<String> {
+    for base in [platform::code_profiles_dir(), profiles_dir()] {
+        let Ok(base) = fs::canonicalize(&base) else {
+            continue;
+        };
+        if let Ok(rel) = target.strip_prefix(&base) {
+            let first = rel.components().next()?;
+            let name = first.as_os_str().to_string_lossy();
+            return Some(name.trim_end_matches(".json").to_string());
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn check_live_link(path: &Path, label: &str, active: &str, out: &mut Vec<String>) {
+    match platform::read_link_target(path) {
+        Some(target) => match owning_profile(&target) {
+            Some(name) if name == active => {}
+            Some(name) => out.push(format!("{label} resolves to profile '{name}', not '{active}'")),
+            None => out.push(format!(
+                "{label} resolves outside the profiles tree: {}",
+                target.display()
+            )),
+        },
+        None if path.exists() => out.push(format!("{label} is real state, not a link — unmanaged")),
+        None => out.push(format!("{label} is missing")),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn scan_escapes(dir: &Path, active: &str, out: &mut Vec<String>, depth: usize, budget: &mut usize) {
+    if depth == 0 || *budget == 0 {
+        return;
+    }
+    let Ok(rd) = fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        if *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        let p = e.path();
+        let Ok(m) = fs::symlink_metadata(&p) else {
+            continue;
+        };
+        if m.file_type().is_symlink() {
+            if let Some(name) = platform::read_link_target(&p).as_deref().and_then(owning_profile)
+                && name != active
+            {
+                out.push(format!("{} reaches into profile '{name}'", p.display()));
+            }
+        } else if m.is_dir() {
+            scan_escapes(&p, active, out, depth - 1, budget);
+        }
+    }
+}
+
+// Every way the active profile could still see another profile's data. Empty
+// means isolated.
+#[cfg(target_os = "linux")]
+pub fn audit_isolation() -> Vec<String> {
+    let Some(active) = current_profile() else {
+        return vec!["No active profile — Claude's config is unmanaged.".into()];
+    };
+    let mut out = Vec::new();
+    check_live_link(&claude_app_dir(), "~/.config/Claude", &active, &mut out);
+    check_live_link(&platform::code_app_dir(), "~/.claude", &active, &mut out);
+    check_live_link(&platform::code_app_json(), "~/.claude.json", &active, &mut out);
+
+    let mut budget = SCAN_MAX_ENTRIES;
+    for root in [code_profile_dir(&active), profiles_dir().join(&active)] {
+        scan_escapes(&root, &active, &mut out, SCAN_MAX_DEPTH, &mut budget);
+    }
+    if budget == 0 {
+        out.push(format!(
+            "Scan stopped after {SCAN_MAX_ENTRIES} entries — result is partial."
+        ));
+    }
+    out
+}
+
+// ── Menu actions (Linux only) ────────────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+pub fn import_memory_from(source: &str, project: &str) {
+    let files = list_memory_files(source, project);
+    if files.is_empty() {
+        platform::notify(&format!(
+            "'{source}' has no memory for {}",
+            project_label(project)
+        ));
+        return;
+    }
+    let Some(picks) = platform::pick_items(
+        &format!(
+            "Copy memory from '{source}' into the active profile for {}.\n\
+             Only what you check is copied — the rest of '{source}' stays out of reach.",
+            project_label(project)
+        ),
+        &files,
+    ) else {
+        return;
+    };
+    match import_memory(source, project, &picks) {
+        Ok(n) => platform::notify(&format!(
+            "Imported {n} memory file(s) from '{source}' — picked up by new Claude Code sessions"
+        )),
+        Err(e) => platform::notify(&format!("Memory import failed: {e}")),
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn import_skills_from(source: &str) {
+    let skills = list_code_skills(source);
+    if skills.is_empty() {
+        platform::notify(&format!("'{source}' has no skills"));
+        return;
+    }
+    let Some(picks) = platform::pick_items(
+        &format!(
+            "Copy skills from '{source}' into the active profile.\n\
+             Only what you check is copied — the rest of '{source}' stays out of reach."
+        ),
+        &skills,
+    ) else {
+        return;
+    };
+    match import_skills(source, &picks) {
+        Ok((n, 0)) => platform::notify(&format!(
+            "Imported {n} skill(s) from '{source}' — picked up by new Claude Code sessions"
+        )),
+        Ok((n, d)) => platform::notify(&format!(
+            "Imported {n} skill(s) from '{source}' — {d} dangling symlink(s) copied as-is"
+        )),
+        Err(e) => platform::notify(&format!("Skill import failed: {e}")),
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn show_isolation_report() {
+    let findings = audit_isolation();
+    let body = if findings.is_empty() {
+        format!(
+            "Isolation OK.\n\n\
+             ~/.config/Claude, ~/.claude and ~/.claude.json all resolve inside the active \
+             profile, and nothing inside it links into another profile.\n\n\
+             Imports are content copies, logged to:\n{}",
+            platform::code_profiles_dir().join(IMPORT_LOG_FILE).display()
+        )
+    } else {
+        format!(
+            "{} issue(s) found:\n\n• {}",
+            findings.len(),
+            findings.join("\n• ")
+        )
+    };
+    platform::info("Claude Switcher — isolation", &body);
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs as unix_fs;
+
+    const KEY: &str = "-home-user-proj";
+
+    fn write(path: &Path, body: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+
+    fn is_symlink(path: &Path) -> bool {
+        fs::symlink_metadata(path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+    }
+
+    // A two-profile install with 'Dst' active, matching the real layout.
+    fn sandbox() -> PathBuf {
+        let home = std::env::temp_dir().join(format!("claude-switcher-t{}", std::process::id()));
+        fs::remove_dir_all(&home).ok();
+        fs::create_dir_all(home.join(".config")).unwrap();
+        unsafe { std::env::set_var("HOME", &home) };
+
+        let desktop = home.join(".config").join("claude-profiles");
+        let code = home.join(".config").join("claude-code-profiles");
+        for p in ["Src", "Dst"] {
+            fs::create_dir_all(desktop.join(p)).unwrap();
+            fs::create_dir_all(code.join(p)).unwrap();
+        }
+
+        let src_mem = code.join("Src").join("projects").join(KEY).join("memory");
+        write(
+            &src_mem.join(MEMORY_INDEX_FILE),
+            "# Memory\n\n- [Alpha](a.md) — alpha hook\n",
+        );
+        write(&src_mem.join("a.md"), "---\nname: alpha\n---\n\nalpha body\n");
+        write(&src_mem.join("b.md"), "---\nname: beta\n---\n\nbeta body\n");
+
+        let src_skills = code.join("Src").join(SKILLS_DIR_NAME);
+        write(&src_skills.join("plain").join("SKILL.md"), "plain skill\n");
+        write(&home.join("shared").join("lib").join("SKILL.md"), "shared skill\n");
+        unix_fs::symlink(home.join("shared").join("lib"), src_skills.join("linked")).unwrap();
+        unix_fs::symlink("../../nowhere", src_skills.join("broken")).unwrap();
+
+        write(
+            &code.join("Dst").join("projects").join(KEY).join("memory").join(MEMORY_INDEX_FILE),
+            "# Memory\n\n- [Kept](kept.md) — pre-existing\n",
+        );
+
+        write(&code.join("Dst.json"), "{}\n");
+        unix_fs::symlink(desktop.join("Dst"), home.join(".config").join("Claude")).unwrap();
+        unix_fs::symlink(code.join("Dst"), home.join(".claude")).unwrap();
+        unix_fs::symlink(code.join("Dst.json"), home.join(".claude.json")).unwrap();
+        home
+    }
+
+    #[test]
+    fn import_copies_only_what_was_picked_and_keeps_profiles_isolated() {
+        let home = sandbox();
+        let code = home.join(".config").join("claude-code-profiles");
+        assert_eq!(current_profile().as_deref(), Some("Dst"));
+
+        assert_eq!(list_memory_projects("Src"), vec![KEY.to_string()]);
+        assert_eq!(list_memory_files("Src", KEY), vec!["a.md", "b.md"]);
+        assert_eq!(import_sources(Some("Dst")), vec!["Src".to_string()]);
+        let home_key = home.to_string_lossy().replace('/', "-");
+        assert_eq!(project_label(&format!("{home_key}-proj")), "~/proj");
+        assert_eq!(project_label("-home-user-proj"), "-home-user-proj");
+
+        assert_eq!(import_memory("Src", KEY, &["a.md".into()]).unwrap(), 1);
+        let dst_mem = code.join("Dst").join("projects").join(KEY).join("memory");
+        assert_eq!(fs::read_to_string(dst_mem.join("a.md")).unwrap(), "---\nname: alpha\n---\n\nalpha body\n");
+        assert!(!is_symlink(&dst_mem.join("a.md")), "import must be a copy, not a link");
+        assert!(!dst_mem.join("b.md").exists(), "unpicked memory must not cross");
+
+        let index = fs::read_to_string(dst_mem.join(MEMORY_INDEX_FILE)).unwrap();
+        assert!(index.contains("- [Kept](kept.md) — pre-existing"));
+        assert!(index.contains("- [Alpha](a.md) — alpha hook"));
+        assert!(!index.contains("(b.md)"));
+
+        // Re-importing the same file must not duplicate its index line.
+        assert_eq!(import_memory("Src", KEY, &["a.md".into()]).unwrap(), 1);
+        let index = fs::read_to_string(dst_mem.join(MEMORY_INDEX_FILE)).unwrap();
+        assert_eq!(index.matches("(a.md)").count(), 1);
+
+        let picks = ["plain".into(), "linked".into(), "broken".into()];
+        assert_eq!(import_skills("Src", &picks).unwrap(), (3, 1));
+        let dst_skills = code.join("Dst").join(SKILLS_DIR_NAME);
+        assert_eq!(fs::read_to_string(dst_skills.join("plain").join("SKILL.md")).unwrap(), "plain skill\n");
+        assert!(!is_symlink(&dst_skills.join("plain")));
+        assert!(!is_symlink(&dst_skills.join("linked")), "a linked skill must be dereferenced");
+        assert_eq!(fs::read_to_string(dst_skills.join("linked").join("SKILL.md")).unwrap(), "shared skill\n");
+        assert!(is_symlink(&dst_skills.join("broken")), "a dangling link is carried over as-is");
+
+        assert!(import_memory("Dst", KEY, &["a.md".into()]).is_err());
+        assert_eq!(audit_isolation(), Vec::<String>::new());
+
+        unix_fs::symlink(
+            code.join("Src").join(SKILLS_DIR_NAME).join("plain"),
+            dst_skills.join("leak"),
+        )
+        .unwrap();
+        let findings = audit_isolation();
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].contains("reaches into profile 'Src'"));
+
+        fs::remove_dir_all(&home).ok();
+    }
 }

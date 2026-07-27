@@ -2,7 +2,7 @@
 
 A system tray app for switching between multiple Claude Desktop profiles on **Linux** and **Windows**.
 
-On Linux, each profile swaps **both** Claude products in lockstep via symlink, so work and personal stay fully isolated — neither account can read the other's sessions, settings, history, MCP servers, memories, or skills:
+On Linux, each profile swaps **both** Claude products in lockstep via symlink, so work and personal stay fully isolated — neither account can read the other's sessions, settings, history, MCP servers, memories, or skills unless you [explicitly import them](#importing-memory-and-skills):
 
 | Product | Live path | Swapped to |
 |---|---|---|
@@ -82,6 +82,10 @@ Click the tray icon:
   - **Edit config…** — opens `claude_desktop_config.json` in your default editor.
   - **Open backups folder (N)** — opens the backups directory.
   - **Clear all MCP servers** — wipes the `mcpServers` map (backed up first).
+- **Memory & skills ▸** (Linux) — the only way Claude Code memory or skills cross from one profile into another. See [Importing memory and skills](#importing-memory-and-skills).
+  - **Import memory from ▸ \<profile\> ▸ \<project\> (N)** — checklist of that profile's memory files for that project.
+  - **Import skills from ▸ \<profile\> (N)** — checklist of that profile's `skills/` entries.
+  - **Check isolation…** — audits the live links and reports anything that would let the active profile see another profile's data.
 - **New profile…** — prompts for a name. On first use, this migrates your existing Claude config into a profile.
 - **Rename profile ▸ \<profile\>** — prompts for a new name. Renaming the active profile closes Claude first (with confirmation) and re-points the link; inactive profiles rename in-place without touching Claude.
 - **Relaunch Claude after switch** — toggle. When on, the app is restarted after switching/importing.
@@ -107,6 +111,7 @@ If Claude is running, you get a confirmation before it's killed.
 ~/.config/claude-code-profiles/    (Claude Code — CLI / embedded agent)
     personal/      personal.json
     work/          work.json
+    .imports.log                   → append-only record of every cross-profile import
 ```
 
 Switching closes Claude, repoints all three symlinks to the chosen profile, and (optionally) relaunches. A brand-new profile starts with an empty Claude Code dir, so that account logs in fresh.
@@ -114,6 +119,36 @@ Switching closes Claude, repoints all three symlinks to the chosen profile, and 
 ### Adopting your existing Claude Code config
 
 The first time you switch (or via **Link Claude Code → \<active\>**), your live `~/.claude` and `~/.claude.json` are **moved** into the *currently active* profile — so whatever account you're logged into now is preserved under that name. From then on they're symlinks the switcher manages. The originals are captured by `fs::rename` (a move, same filesystem); on any conflict the live copy is backed up first (see below).
+
+### Importing memory and skills
+
+Claude Code keeps memory per project and skills per profile:
+
+```
+~/.config/claude-code-profiles/<profile>/
+    projects/<project-key>/memory/     → MEMORY.md index + one file per memory
+    skills/                            → one directory (or symlink) per skill
+```
+
+Only the active profile sits on a path Claude reads, so an inactive profile's memory and skills are unreachable by default — Claude doesn't load them and doesn't see the directory. **Memory & skills ▸** is the single deliberate exception, and it moves nothing you didn't check in the dialog.
+
+What an import does:
+
+- Copies **only the checked entries**. Nothing else crosses, and the source profile is never modified.
+- Memory lands under the **same project key** in the active profile, so recall keeps working for that working directory.
+- The destination `MEMORY.md` gains a pointer line per imported file — the source's own line, or one built from the file's `name:` / `description:` frontmatter. Existing lines are untouched, and re-importing a file doesn't duplicate its line.
+- Transfers are **content copies, never links**. A skill that was a symlink — including one into a library both profiles share — is dereferenced into a standalone copy, so the source can't influence it after the fact. A dangling symlink is copied verbatim and reported in the notification.
+- Anything an import would overwrite is backed up first.
+- Every import appends to `~/.config/claude-code-profiles/.imports.log`, which lives outside every profile directory and so is itself off any path Claude reads.
+
+Imports are picked up by **new** Claude Code sessions; a session already running has loaded its memory.
+
+**Check isolation…** audits the invariant and reports:
+
+- any of `~/.config/Claude`, `~/.claude`, `~/.claude.json` that isn't a link into the active profile — including unmanaged real state left behind by an app update, and
+- any symlink inside the active profile that resolves into a *different* profile.
+
+An empty report means no inactive profile's data is on a path Claude reads.
 
 **Windows:**
 
@@ -137,6 +172,9 @@ Every operation that could lose data writes a backup to `.backups/` first:
 |---|---|
 | Import MCP servers | previous `claude_desktop_config.json` |
 | Clear MCP servers | previous `claude_desktop_config.json` |
+| Import memory (file already present) | previous memory file copied to `.backups/<ts>_memory-import_<file>.md` |
+| Import memory (index gains lines) | previous `MEMORY.md` copied to `.backups/<ts>_memory-import_MEMORY.md` |
+| Import skills (skill already present) | previous skill dir moved to `.backups/<ts>_skill-import_<skill>/` |
 | `Edit config…` | atomic write (`.tmp` + rename) — no partial writes |
 | Switch profile (live Desktop dir conflicts with target) | live dir moved to `.backups/<ts>_preswitch_Claude/` |
 | Switch / link Claude Code (live `~/.claude` conflicts with target) | live dir moved to `.backups/<ts>_preswitch-code_.claude/` |
@@ -149,6 +187,6 @@ Backups are timestamped (`<unix-ts>_<profile>_<filename>`) and never auto-pruned
 - Closing Claude before switching is required — Electron locks its config dir, and Claude Code holds `~/.claude` open. The switcher kills both automatically (after confirmation if anything was running). **This includes Claude Desktop's embedded agent**, which is a `claude` process using `~/.claude`, so an in-progress agent session ends on switch.
 - Process matching is deliberately narrow so a switch doesn't kill unrelated things: Claude Desktop is matched by the Electron flag `--class=Claude` (plus its `--user-data-dir` helpers and the `claude-desktop` launcher); Claude Code is matched by the **exact** process name `claude`. A shell or editor whose path merely contains "Claude" is left alone.
 - Profile dirs are real directories on disk; the active one is reached via the symlinks at `~/.config/Claude`, `~/.claude`, and `~/.claude.json` on Linux, or via junction at `%APPDATA%\Claude` on Windows. Manual edits to either are safe.
-- Isolation is logical, not OS-enforced: all profiles belong to your Unix user, so the guarantee is "the inactive account's data isn't on any path Claude reads," not a permission boundary.
+- Isolation is logical, not OS-enforced: all profiles belong to your Unix user, so the guarantee is "the inactive account's data isn't on any path Claude reads," not a permission boundary. **Memory & skills ▸** is the only path across that line, it copies only what you check, and **Check isolation…** verifies the invariant on demand.
 - If a Claude auto-update ever replaces a symlink with a real directory, the next switch treats it as unmanaged state and backs it up before re-linking.
 - On Windows, MCP import uses confirm dialogs and per-server submenu items instead of KDE's checklist dialog.

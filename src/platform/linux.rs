@@ -130,34 +130,44 @@ pub fn prompt_text(title: &str, prompt: &str, default: Option<&str>) -> Option<S
     }
 }
 
-pub fn pick_servers(source_label: &str, servers: &[String]) -> Option<Vec<String>> {
-    if servers.is_empty() {
-        notify(&format!("'{source_label}' has no MCP servers"));
-        return None;
-    }
+pub fn info(title: &str, body: &str) {
+    let _ = Command::new("kdialog")
+        .args(["--title", title, "--msgbox", body])
+        .status();
+}
+
+// Multi-select checklist; every item starts unchecked. None on cancel or empty.
+pub fn pick_items(prompt: &str, items: &[String]) -> Option<Vec<String>> {
     let mut cmd = Command::new("kdialog");
     cmd.args([
         "--title",
         "Claude Switcher",
         "--separate-output",
         "--checklist",
-        &format!("Import from '{source_label}' (same-named servers will be overwritten):"),
+        prompt,
     ]);
-    for s in servers {
+    for s in items {
         cmd.arg(s).arg(s).arg("off");
     }
     let out = cmd.output().ok()?;
     if !out.status.success() {
         return None;
     }
-    let names: Vec<String> = String::from_utf8_lossy(&out.stdout)
+    let picked: Vec<String> = String::from_utf8_lossy(&out.stdout)
         .lines()
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect();
-    if names.is_empty() {
-        None
-    } else {
-        Some(names)
+    if picked.is_empty() { None } else { Some(picked) }
+}
+
+pub fn pick_servers(source_label: &str, servers: &[String]) -> Option<Vec<String>> {
+    if servers.is_empty() {
+        notify(&format!("'{source_label}' has no MCP servers"));
+        return None;
     }
+    pick_items(
+        &format!("Import from '{source_label}' (same-named servers will be overwritten):"),
+        servers,
+    )
 }
